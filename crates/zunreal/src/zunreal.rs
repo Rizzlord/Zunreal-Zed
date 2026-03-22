@@ -1,7 +1,7 @@
 use gpui::*;
-use ui::{prelude::*, ButtonLike};
+use ui::prelude::*;
 use workspace::dock::{Panel, PanelEvent, DockPosition};
-use workspace::{Workspace, StatusItemView, ItemHandle};
+use workspace::Workspace;
 use project::{Project, TaskSourceKind};
 use gpui_util::ResultExt;
 use settings::Settings;
@@ -100,78 +100,90 @@ impl ZunrealPanel {
     pub fn register(cx: &mut App) {
         ZunrealSettings::register(cx);
     }
-
-    pub fn schedule_unreal_task(&self, label: &str, command: &str, args: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(workspace) = self.workspace.upgrade() else { return };
-        let project_name = self.project_name.as_deref().unwrap_or("Unknown");
-        let settings = ZunrealSettings::get_global(cx);
+    fn render_action_button(&self, label: SharedString, tool: &'static str, args: Vec<String>, cx: &mut Context<Self>) -> impl IntoElement {
+        let tool = tool.to_string();
+        let args = args.clone();
+        let uproject_path = self.uproject_path.clone();
+        let workspace_handle = self.workspace.clone();
+        let project_name = self.project_name.as_deref().unwrap_or("Unknown").to_string();
         
-        let mut full_command = command.to_string();
-        if let Some(engine_path) = &settings.engine_path {
-            let engine_path = std::path::Path::new(engine_path);
-            if command == "UnrealBuildTool" {
-                #[cfg(target_os = "linux")]
-                {
-                    full_command = format!("\"{}\"", engine_path.join("Engine/Build/BatchFiles/Linux/Build.sh").to_string_lossy());
+        div()
+            .w_full()
+            .id(label.clone())
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_center()
+                    .py_1()
+                    .child(Label::new(label.clone()).size(LabelSize::Small))
+            )
+            .on_click(move |_, window: &mut Window, cx| {
+                if let Some(path) = uproject_path.clone() {
+                    schedule_unreal_task(workspace_handle.clone(), Some(project_name.clone()), window, cx, &tool, args.clone(), path);
                 }
-                #[cfg(target_os = "windows")]
-                {
-                    full_command = format!("\"{}\"", engine_path.join("Engine/Build/BatchFiles/Build.bat").to_string_lossy());
-                }
-            } else if command == "UnrealEditor" {
-                #[cfg(target_os = "linux")]
-                {
-                    let is_wayland = std::env::var("XDG_SESSION_TYPE").map(|s| s == "wayland").unwrap_or(false);
-                    let env_prefix = if is_wayland {
-                        "env SDL_VIDEODRIVER=x11 QT_QPA_PLATFORM=xcb SDL_VIDEO_X11_FORCE_EGL=1 "
-                    } else {
-                        ""
-                    };
-                    full_command = format!("{}\"{}\"", env_prefix, engine_path.join("Engine/Binaries/Linux/UnrealEditor").to_string_lossy());
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    full_command = format!("\"{}\"", engine_path.join("Engine/Binaries/Win64/UnrealEditor.exe").to_string_lossy());
-                }
+            })
+            .cursor_pointer()
+            .bg(cx.theme().colors().editor_background)
+            .hover(|style: StyleRefinement| style.bg(cx.theme().colors().element_active))
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .rounded_md()
+    }
+}
+ 
+pub fn schedule_unreal_task(workspace_handle: WeakEntity<Workspace>, project_name: Option<String>, window: &mut Window, cx: &mut App, command: &str, args: Vec<String>, _uproject_path: Arc<std::path::Path>) {
+    let Some(workspace) = workspace_handle.upgrade() else { return };
+    let project_name = project_name.as_deref().unwrap_or("Unknown");
+    let settings = ZunrealSettings::get_global(cx);
+    
+    let mut full_command = command.to_string();
+    if let Some(engine_path) = &settings.engine_path {
+        let engine_path = std::path::Path::new(engine_path);
+        if command == "UnrealBuildTool" {
+            #[cfg(target_os = "linux")]
+            {
+                full_command = format!("\"{}\"", engine_path.join("Engine/Build/BatchFiles/Linux/Build.sh").to_string_lossy());
+            }
+            #[cfg(target_os = "windows")]
+            {
+                full_command = format!("\"{}\"", engine_path.join("Engine/Build/BatchFiles/Build.bat").to_string_lossy());
+            }
+        } else if command == "UnrealEditor" {
+            #[cfg(target_os = "linux")]
+            {
+                let is_wayland = std::env::var("XDG_SESSION_TYPE").map(|s| s == "wayland").unwrap_or(false);
+                let env_prefix = if is_wayland {
+                    "env SDL_VIDEODRIVER=x11 QT_QPA_PLATFORM=xcb SDL_VIDEO_X11_FORCE_EGL=1 "
+                } else {
+                    ""
+                };
+                full_command = format!("{}\"{}\"", env_prefix, engine_path.join("Engine/Binaries/Linux/UnrealEditor").to_string_lossy());
+            }
+            #[cfg(target_os = "windows")]
+            {
+                full_command = format!("\"{}\"", engine_path.join("Engine/Binaries/Win64/UnrealEditor.exe").to_string_lossy());
             }
         }
-        
-        let template = TaskTemplate {
-            label: format!("Zunreal: {} ({})", label, project_name),
-            command: full_command,
-            args,
-            reveal_target: RevealTarget::Dock,
-            ..Default::default()
-        };
-
-        workspace.update(cx, |workspace, cx| {
-            workspace.schedule_task(
-                TaskSourceKind::UserInput,
-                &template,
-                &TaskContext::default(),
-                false,
-                window,
-                cx,
-            );
-        });
     }
-
-    fn render_action_button(&self, label: &str, command: &str, args: Vec<String>, cx: &mut Context<Self>) -> impl IntoElement {
-        let label = label.to_string();
-        let command = command.to_string();
-        let uproject_path = self.uproject_path.clone();
-        Button::new(label.to_lowercase(), label.clone())
-            .on_click(cx.listener({
-                let label = label.clone();
-                move |this, _, window, cx| {
-                    if let Some(_) = &uproject_path {
-                        this.schedule_unreal_task(&label, &command, args.clone(), window, cx);
-                    }
-                }
-            }))
-            .full_width()
-            .style(ButtonStyle::Filled)
-    }
+    
+    let template = TaskTemplate {
+        label: format!("Zunreal: {} ({})", command, project_name),
+        command: full_command,
+        args,
+        reveal_target: RevealTarget::Dock,
+        ..Default::default()
+    };
+ 
+    workspace.update(cx, |workspace, cx| {
+        workspace.schedule_task(
+            TaskSourceKind::UserInput,
+            &template,
+            &TaskContext::default(),
+            false,
+            window,
+            cx,
+        );
+    });
 }
 
 impl Render for ZunrealPanel {
@@ -205,47 +217,13 @@ impl Render for ZunrealPanel {
             .child(
                 v_flex()
                     .gap_2()
-                    .child(self.render_action_button("Build", "UnrealBuildTool", vec![ format!("{}Editor", self.project_name.clone().unwrap_or_default()), "Linux".to_string(), "Development".to_string(), format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()) ], cx))
-                    .child(self.render_action_button("Open Editor", "UnrealEditor", vec![ format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()) ], cx))
-                    .child(self.render_action_button("Cook", "UnrealEditor", vec![ format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-run=Cook".to_string(), "-targetplatform=Linux".to_string() ], cx))
-                    .child(self.render_action_button("Run Game", "UnrealEditor", vec![ format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-game".to_string() ], cx))
-                    .child(self.render_action_button("Generate Project Files", "UnrealBuildTool", vec![ "-projectfiles".to_string(), format!("-project=\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()) ], cx))
-                    .child(self.render_action_button("Generate IntelliSense", "UnrealBuildTool", vec![ "-mode=GenerateClangDatabase".to_string(), format!("-project=\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-game".to_string(), "-engine".to_string(), "-Linux".to_string(), "-Development".to_string() ], cx))
+                    .child(self.render_action_button("Build".into(), "UnrealBuildTool", vec![ format!("{}Editor", self.project_name.clone().unwrap_or_default()), "Linux".to_string(), "Development".to_string(), format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()) ], cx))
+                    .child(self.render_action_button("Open Editor".into(), "UnrealEditor", vec![ format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()) ], cx))
+                    .child(self.render_action_button("Cook".into(), "UnrealEditor", vec![ format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-run=Cook".to_string(), "-targetplatform=Linux".to_string() ], cx))
+                    .child(self.render_action_button("Run Game".into(), "UnrealEditor", vec![ format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-game".to_string() ], cx))
+                    .child(self.render_action_button("Generate Project Files".into(), "UnrealBuildTool", vec![ "-projectfiles".to_string(), format!("-project=\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()) ], cx))
+                    .child(self.render_action_button("Generate IntelliSense".into(), "UnrealBuildTool", vec![ format!("{}Editor", self.project_name.clone().unwrap_or_default()), "Linux".to_string(), "Development".to_string(), "-mode=GenerateClangDatabase".to_string(), format!("-project=\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-game".to_string(), "-engine".to_string() ], cx))
             )
-    }
-}
-
-pub struct ZunrealStatusIndicator;
-
-impl ZunrealStatusIndicator {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Render for ZunrealStatusIndicator {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        ButtonLike::new("zunreal-status")
-            .child(
-                h_flex()
-                    .bg(rgb(0x0070FF)) // Unreal Blue
-                    .rounded_md()
-                    .px_2()
-                    .child(Label::new("Zunreal").size(LabelSize::Small).color(Color::Default))
-            )
-            .on_click(move |_, window: &mut Window, cx| {
-                window.dispatch_action(ToggleZunrealPanel.boxed_clone(), cx);
-            })
-    }
-}
-
-impl StatusItemView for ZunrealStatusIndicator {
-    fn set_active_pane_item(
-        &mut self,
-        _active_pane_item: Option<&dyn ItemHandle>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
     }
 }
 

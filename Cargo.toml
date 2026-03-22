@@ -470,6 +470,7 @@ zlog = { path = "crates/zlog" }
 zlog_settings = { path = "crates/zlog_settings" }
 ztracing = { path = "crates/ztracing" }
 ztracing_macro = { path = "crates/ztracing_macro" }
+zunreal = { path = "crates/zunreal" }
 
 #
 # External crates

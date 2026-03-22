@@ -102,6 +102,7 @@ use zed_actions::{
     OpenAccountSettings, OpenBrowser, OpenDocs, OpenServerSettings, OpenSettingsFile, OpenZedUrl,
     Quit,
 };
+use zunreal::ZunrealPanel;
 
 actions!(
     zed,
@@ -154,6 +155,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    zunreal::init(cx);
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &Hide, cx| cx.hide());
     #[cfg(target_os = "macos")]
@@ -499,6 +501,9 @@ pub fn initialize_workspace(
             status_bar.add_right_item(vim_mode_indicator, window, cx);
             status_bar.add_right_item(cursor_position, window, cx);
             status_bar.add_right_item(image_info, window, cx);
+
+            let zunreal_indicator = cx.new(|_| zunreal::ZunrealStatusIndicator::new());
+            status_bar.add_right_item(zunreal_indicator, window, cx);
         });
 
         let panels_task = initialize_panels(prompt_builder.clone(), window, cx);
@@ -640,7 +645,8 @@ fn initialize_panels(
             workspace_handle.clone(),
             cx.clone(),
         );
-        let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
+        let debug_panel = DebugPanel::load(workspace_handle.clone(), &mut cx.clone());
+        let zunreal_panel = ZunrealPanel::load(workspace_handle.clone(), &mut cx.clone());
 
         async fn add_panel_when_ready(
             panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
@@ -665,6 +671,7 @@ fn initialize_panels(
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(notification_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(zunreal_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle, prompt_builder, cx.clone()).map(|r| r.log_err()),
         );
 

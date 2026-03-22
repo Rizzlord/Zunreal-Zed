@@ -22105,6 +22105,7 @@ dependencies = [
  "zlog",
  "zlog_settings",
  "ztracing",
+ "zunreal",
 ]
 
 [[package]]
@@ -22548,6 +22549,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29ce2c8a9384ad323cf564b67da86e21d3cfdff87908bc1223ed5c99bc792713"
 dependencies = [
  "zune-core",
+]
+
+[[package]]
+name = "zunreal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "collections",
+ "db",
+ "editor",
+ "fs",
+ "futures 0.3.31",
+ "gpui",
+ "gpui_util",
+ "language",
+ "project",
+ "serde",
+ "serde_json",
+ "settings",
+ "task",
+ "theme",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
 ]
 
 [[package]]

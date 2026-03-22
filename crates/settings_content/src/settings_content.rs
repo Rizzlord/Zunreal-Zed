@@ -10,6 +10,8 @@ mod serde_helper;
 mod terminal;
 mod theme;
 mod workspace;
+mod zunreal;
+
 
 pub use agent::*;
 pub use editor::*;
@@ -27,6 +29,8 @@ use settings_json::parse_json_with_comments;
 pub use terminal::*;
 pub use theme::*;
 pub use workspace::*;
+pub use zunreal::*;
+
 
 use collections::{HashMap, IndexMap};
 use schemars::JsonSchema;
@@ -202,6 +206,9 @@ pub struct SettingsContent {
 
     /// Settings related to Vim mode in Zed.
     pub vim: Option<VimSettingsContent>,
+
+    /// Settings related to Unreal Engine integration.
+    pub zunreal: Option<ZunrealSettingsContent>,
 }
 
 impl SettingsContent {

@@ -502,8 +502,6 @@ pub fn initialize_workspace(
             status_bar.add_right_item(cursor_position, window, cx);
             status_bar.add_right_item(image_info, window, cx);
 
-            let zunreal_indicator = cx.new(|_| zunreal::ZunrealStatusIndicator::new());
-            status_bar.add_right_item(zunreal_indicator, window, cx);
         });
 
         let panels_task = initialize_panels(prompt_builder.clone(), window, cx);

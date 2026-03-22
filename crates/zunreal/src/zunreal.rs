@@ -170,7 +170,7 @@ impl ZunrealPanel {
                 }
             }))
             .full_width()
-            .when(label == "Build" || label == "Open Editor" || label == "Run Game", |this| this.style(ButtonStyle::Filled))
+            .style(ButtonStyle::Filled)
     }
 }
 
@@ -181,13 +181,13 @@ impl Render for ZunrealPanel {
         let project_name = self.project_name.as_deref().unwrap_or("No Project Detected");
 
         v_flex()
-            .bg(rgb(0x121212)) // UE charcoal
+            .bg(cx.theme().colors().panel_background)
             .size_full()
             .p_4()
             .gap_4()
             .child(
                 v_flex()
-                    .child(Label::new("ZUNREAL").size(LabelSize::Large).color(Color::Accent))
+                    .child(Label::new("Unreal Engine").size(LabelSize::Large).color(Color::Default))
                     .child(Label::new(format!("Project: {}", project_name)).size(LabelSize::Small).color(Color::Muted))
             )
             .when(!has_engine_path, |this| {
@@ -207,10 +207,10 @@ impl Render for ZunrealPanel {
                     .gap_2()
                     .child(self.render_action_button("Build", "UnrealBuildTool", vec![ format!("{}Editor", self.project_name.clone().unwrap_or_default()), "Linux".to_string(), "Development".to_string(), format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()) ], cx))
                     .child(self.render_action_button("Open Editor", "UnrealEditor", vec![ format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()) ], cx))
-                    .child(self.render_action_button("Generate IntelliSense", "UnrealBuildTool", vec![ "-mode=GenerateClangDatabase".to_string(), format!("-project=\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-game".to_string(), "-engine".to_string() ], cx))
-                    .child(self.render_action_button("Run Game", "UnrealEditor", vec![ format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-game".to_string() ], cx))
                     .child(self.render_action_button("Cook", "UnrealEditor", vec![ format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-run=Cook".to_string(), "-targetplatform=Linux".to_string() ], cx))
+                    .child(self.render_action_button("Run Game", "UnrealEditor", vec![ format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-game".to_string() ], cx))
                     .child(self.render_action_button("Generate Project Files", "UnrealBuildTool", vec![ "-projectfiles".to_string(), format!("-project=\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()) ], cx))
+                    .child(self.render_action_button("Generate IntelliSense", "UnrealBuildTool", vec![ "-mode=GenerateClangDatabase".to_string(), format!("-project=\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-game".to_string(), "-engine".to_string(), "-Linux".to_string(), "-Development".to_string() ], cx))
             )
     }
 }

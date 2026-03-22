@@ -166,21 +166,25 @@ pub fn schedule_unreal_task(workspace_handle: WeakEntity<Workspace>, project_nam
         }
     }
     
+    let mut task_args = args;
+    
     // Add symlink logic for IntelliSense generation to ensure Zed's clangd picks it up
-    if command == "UnrealBuildTool" && args.iter().any(|arg| arg.contains("GenerateClangDatabase")) {
+    if command == "UnrealBuildTool" && task_args.iter().any(|arg| arg.contains("GenerateClangDatabase")) {
         if let Some(engine_path) = &settings.engine_path {
             let engine_path = std::path::Path::new(engine_path);
             let engine_cc_json = engine_path.join("compile_commands.json");
             let project_cc_json = _uproject_path.parent().unwrap_or(std::path::Path::new(".")).join("compile_commands.json");
             
-            full_command = format!("{} && ln -sf \"{}\" \"{}\"", full_command, engine_cc_json.to_string_lossy(), project_cc_json.to_string_lossy());
+            // For composite commands, we must include the arguments in the first part of the command
+            full_command = format!("{} {} && ln -sf \"{}\" \"{}\"", full_command, task_args.join(" "), engine_cc_json.to_string_lossy(), project_cc_json.to_string_lossy());
+            task_args = vec![]; // Clear args as they are now in the command string
         }
     }
     
     let template = TaskTemplate {
         label: format!("Zunreal: {} ({})", command, project_name),
         command: full_command,
-        args,
+        args: task_args,
         reveal_target: RevealTarget::Dock,
         ..Default::default()
     };

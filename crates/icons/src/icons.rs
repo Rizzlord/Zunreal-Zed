@@ -277,6 +277,7 @@ pub enum IconName {
     Triangle,
     TriangleRight,
     Undo,
+    Unreal,
     Unpin,
     UserCheck,
     UserGroup,

@@ -13,6 +13,13 @@ pub struct ZunrealSettings {
     pub engine_path: Option<String>,
 }
 
+#[cfg(target_os = "linux")]
+const CURRENT_PLATFORM: &str = "Linux";
+#[cfg(target_os = "windows")]
+const CURRENT_PLATFORM: &str = "Win64";
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+const CURRENT_PLATFORM: &str = "Unknown";
+
 impl Settings for ZunrealSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let zunreal = content.zunreal.as_ref();
@@ -135,6 +142,7 @@ pub fn schedule_unreal_task(workspace_handle: WeakEntity<Workspace>, project_nam
     let Some(workspace) = workspace_handle.upgrade() else { return };
     let project_name = project_name.as_deref().unwrap_or("Unknown");
     let settings = ZunrealSettings::get_global(cx);
+    let template_label = format!("Zunreal: {} ({})", command, project_name);
     
     let mut full_command = command.to_string();
     if let Some(engine_path) = &settings.engine_path {
@@ -146,7 +154,8 @@ pub fn schedule_unreal_task(workspace_handle: WeakEntity<Workspace>, project_nam
             }
             #[cfg(target_os = "windows")]
             {
-                full_command = format!("\"{}\"", engine_path.join("Engine/Build/BatchFiles/Build.bat").to_string_lossy());
+                // On Windows, use single quotes for PowerShell paths to handle spaces reliably.
+                full_command = engine_path.join("Engine/Build/BatchFiles/Build.bat").to_string_lossy().to_string();
             }
         } else if command == "UnrealEditor" {
             #[cfg(target_os = "linux")]
@@ -161,7 +170,8 @@ pub fn schedule_unreal_task(workspace_handle: WeakEntity<Workspace>, project_nam
             }
             #[cfg(target_os = "windows")]
             {
-                full_command = format!("\"{}\"", engine_path.join("Engine/Binaries/Win64/UnrealEditor.exe").to_string_lossy());
+                // On Windows, use single quotes for PowerShell paths to handle spaces reliably.
+                full_command = engine_path.join("Engine/Binaries/Win64/UnrealEditor.exe").to_string_lossy().to_string();
             }
         }
     }
@@ -176,15 +186,67 @@ pub fn schedule_unreal_task(workspace_handle: WeakEntity<Workspace>, project_nam
             let project_cc_json = _uproject_path.parent().unwrap_or(std::path::Path::new(".")).join("compile_commands.json");
             
             // For composite commands, we must include the arguments in the first part of the command
-            full_command = format!("{} {} && ln -sf \"{}\" \"{}\"", full_command, task_args.join(" "), engine_cc_json.to_string_lossy(), project_cc_json.to_string_lossy());
-            task_args = vec![]; // Clear args as they are now in the command string
+            #[cfg(target_os = "linux")]
+            {
+                full_command = format!("{} {} && ln -sf \"{}\" \"{}\"", full_command, task_args.join(" "), engine_cc_json.to_string_lossy(), project_cc_json.to_string_lossy());
+                task_args = vec![]; 
+            }
+            #[cfg(target_os = "windows")]
+            {
+                // On Windows, use an explicit PowerShell command for the composite task.
+                // We wrap the whole logic in powershell -Command to avoid Zed's auto-quoting conflicts.
+                let quoted_args: Vec<String> = task_args.iter().map(|arg| {
+                    if arg.contains(' ') && !arg.starts_with('\"') && !arg.starts_with('\'') {
+                        format!("'{}'", arg)
+                    } else {
+                        arg.clone()
+                    }
+                }).collect();
+                
+                let pwsh_command = format!("& '{}' {} ; cmd /c mklink '{}' '{}'", 
+                    full_command, 
+                    quoted_args.join(" "), 
+                    project_cc_json.to_string_lossy(), 
+                    engine_cc_json.to_string_lossy()
+                );
+                
+                full_command = "powershell".to_string();
+                task_args = vec![
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-Command".to_string(),
+                    pwsh_command
+                ];
+            }
         }
     }
     
+    #[cfg(target_os = "windows")]
+    let (final_command, final_args) = {
+        if command == "UnrealBuildTool" && template_label.contains("Generate IntelliSense") {
+            // Already handled composite command formatting in the IntelliSense block above
+            (full_command, vec![])
+        } else {
+            // For simple commands on Windows, wrap the path in & '...' for PowerShell.
+            // This was confirmed working for the "Generate Project Files" and "Build" tasks.
+            let quoted_args: Vec<String> = task_args.iter().map(|arg| {
+                if arg.contains(' ') && !arg.starts_with('\"') && !arg.starts_with('\'') {
+                    format!("\"{}\"", arg)
+                } else {
+                    arg.clone()
+                }
+            }).collect();
+            (format!("& '{}'", full_command), quoted_args)
+        }
+    };
+    #[cfg(not(target_os = "windows"))]
+    let (final_command, final_args) = (full_command, task_args);
+
     let template = TaskTemplate {
-        label: format!("Zunreal: {} ({})", command, project_name),
-        command: full_command,
-        args: task_args,
+        label: template_label,
+        command: final_command,
+        args: final_args,
         reveal_target: RevealTarget::Dock,
         ..Default::default()
     };
@@ -232,12 +294,12 @@ impl Render for ZunrealPanel {
             .child(
                 v_flex()
                     .gap_2()
-                    .child(self.render_action_button("Build".into(), "UnrealBuildTool", vec![ format!("{}Editor", self.project_name.clone().unwrap_or_default()), "Linux".to_string(), "Development".to_string(), format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()) ], cx))
-                    .child(self.render_action_button("Open Editor".into(), "UnrealEditor", vec![ format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()) ], cx))
-                    .child(self.render_action_button("Cook".into(), "UnrealEditor", vec![ format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-run=Cook".to_string(), "-targetplatform=Linux".to_string() ], cx))
-                    .child(self.render_action_button("Run Game".into(), "UnrealEditor", vec![ format!("\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-game".to_string() ], cx))
-                    .child(self.render_action_button("Generate Project Files".into(), "UnrealBuildTool", vec![ "-projectfiles".to_string(), format!("-project=\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()) ], cx))
-                    .child(self.render_action_button("Generate IntelliSense".into(), "UnrealBuildTool", vec![ format!("{}Editor", self.project_name.clone().unwrap_or_default()), "Linux".to_string(), "Development".to_string(), "-mode=GenerateClangDatabase".to_string(), format!("-project=\"{}\"", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-game".to_string(), "-engine".to_string() ], cx))
+                    .child(self.render_action_button("Build".into(), "UnrealBuildTool", vec![ format!("{}Editor", self.project_name.clone().unwrap_or_default()), CURRENT_PLATFORM.to_string(), "Development".to_string(), self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default() ], cx))
+                    .child(self.render_action_button("Open Editor".into(), "UnrealEditor", vec![ self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default() ], cx))
+                    .child(self.render_action_button("Cook".into(), "UnrealEditor", vec![ self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(), "-run=Cook".to_string(), format!("-targetplatform={}", CURRENT_PLATFORM) ], cx))
+                    .child(self.render_action_button("Run Game".into(), "UnrealEditor", vec![ self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(), "-game".to_string() ], cx))
+                    .child(self.render_action_button("Generate Project Files".into(), "UnrealBuildTool", vec![ "-projectfiles".to_string(), format!("-project={}", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()) ], cx))
+                    .child(self.render_action_button("Generate IntelliSense".into(), "UnrealBuildTool", vec![ format!("{}Editor", self.project_name.clone().unwrap_or_default()), CURRENT_PLATFORM.to_string(), "Development".to_string(), "-mode=GenerateClangDatabase".to_string(), format!("-project={}", self.uproject_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()), "-game".to_string(), "-engine".to_string() ], cx))
             )
     }
 }
@@ -278,7 +340,7 @@ impl Panel for ZunrealPanel {
     }
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
-        Some(IconName::ToolHammer) // Placeholder for Unreal icon
+        Some(IconName::Unreal)
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {

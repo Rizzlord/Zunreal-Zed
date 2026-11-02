@@ -1,6 +1,7 @@
 use crate::{DbThread, DbThreadMetadata, ThreadsDatabase};
-use agent_client_protocol as acp;
+use agent_client_protocol::schema::v2 as acp_v2;
 use anyhow::{Result, anyhow};
+use futures::{FutureExt, future::Shared};
 use gpui::{App, Context, Entity, Global, Task, prelude::*};
 use util::path_list::PathList;
 
@@ -10,6 +11,7 @@ impl Global for GlobalThreadStore {}
 
 pub struct ThreadStore {
     threads: Vec<DbThreadMetadata>,
+    reload_task: Shared<Task<()>>,
 }
 
 impl ThreadStore {
@@ -27,20 +29,30 @@ impl ThreadStore {
     }
 
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let this = Self {
+        let reload_task = Self::spawn_reload(cx);
+        Self {
             threads: Vec::new(),
-        };
-        this.reload(cx);
-        this
+            reload_task,
+        }
     }
 
-    pub fn thread_from_session_id(&self, session_id: &acp::SessionId) -> Option<&DbThreadMetadata> {
+    /// Resolves when the most recently initiated reload has completed.
+    /// Callers that need to read `entries()` and can't tolerate the initial
+    /// empty state must await this before reading.
+    pub fn reload_task(&self) -> Shared<Task<()>> {
+        self.reload_task.clone()
+    }
+
+    pub fn thread_from_session_id(
+        &self,
+        session_id: &acp_v2::SessionId,
+    ) -> Option<&DbThreadMetadata> {
         self.threads.iter().find(|thread| &thread.id == session_id)
     }
 
     pub fn load_thread(
         &mut self,
-        id: acp::SessionId,
+        id: acp_v2::SessionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<DbThread>>> {
         let database_future = ThreadsDatabase::connect(cx);
@@ -52,7 +64,7 @@ impl ThreadStore {
 
     pub fn save_thread(
         &mut self,
-        id: acp::SessionId,
+        id: acp_v2::SessionId,
         thread: crate::DbThread,
         folder_paths: PathList,
         cx: &mut Context<Self>,
@@ -67,7 +79,7 @@ impl ThreadStore {
 
     pub fn delete_thread(
         &mut self,
-        id: acp::SessionId,
+        id: acp_v2::SessionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         let database_future = ThreadsDatabase::connect(cx);
@@ -87,11 +99,19 @@ impl ThreadStore {
         })
     }
 
-    pub fn reload(&self, cx: &mut Context<Self>) {
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.reload_task = Self::spawn_reload(cx);
+    }
+
+    fn spawn_reload(cx: &mut Context<Self>) -> Shared<Task<()>> {
         let database_connection = ThreadsDatabase::connect(cx);
         cx.spawn(async move |this, cx| {
-            let database = database_connection.await.map_err(|err| anyhow!(err))?;
-            let all_threads = database.list_threads().await?;
+            let Ok(database) = database_connection.await.map_err(|err| anyhow!(err)) else {
+                return;
+            };
+            let Ok(all_threads) = database.list_threads().await else {
+                return;
+            };
             this.update(cx, |this, cx| {
                 this.threads.clear();
                 for thread in all_threads {
@@ -102,8 +122,9 @@ impl ThreadStore {
                 }
                 cx.notify();
             })
+            .ok();
         })
-        .detach_and_log_err(cx);
+        .shared()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -112,6 +133,10 @@ impl ThreadStore {
 
     pub fn entries(&self) -> impl Iterator<Item = DbThreadMetadata> + '_ {
         self.threads.iter().cloned()
+    }
+
+    pub fn entry_ids(&self) -> impl Iterator<Item = acp_v2::SessionId> + '_ {
+        self.threads.iter().map(|t| t.id.clone())
     }
 }
 
@@ -123,8 +148,8 @@ mod tests {
     use gpui::TestAppContext;
     use std::sync::Arc;
 
-    fn session_id(value: &str) -> acp::SessionId {
-        acp::SessionId::new(Arc::<str>::from(value))
+    fn session_id(value: &str) -> acp_v2::SessionId {
+        acp_v2::SessionId::new(Arc::<str>::from(value))
     }
 
     fn make_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {
@@ -138,13 +163,14 @@ mod tests {
             request_token_usage: HashMap::default(),
             model: None,
             profile: None,
-            imported: false,
             subagent_context: None,
             speed: None,
             thinking_enabled: false,
             thinking_effort: None,
             draft_prompt: None,
             ui_scroll_position: None,
+            sandboxed_terminal_temp_dir: None,
+            sandbox_grants: Default::default(),
         }
     }
 

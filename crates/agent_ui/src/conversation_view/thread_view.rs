@@ -1,20 +1,62 @@
-use crate::SelectPermissionGranularity;
-use std::cell::RefCell;
+use crate::{
+    DEFAULT_THREAD_TITLE, SelectPermissionGranularity,
+    conversation_view::thread_search_bar::{ThreadSearchBar, ThreadSearchBarEvent},
+    open_abs_path_at_point, project_path_for_file_link,
+    thread_metadata_store::{ThreadId, ThreadMetadataStore},
+};
+use agent_client_protocol::schema::v2 as acp_v2;
+use std::{cell::RefCell, path::Path};
 
-use acp_thread::ContentBlock;
+use acp_thread::{
+    Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity,
+    SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
+    SubmissionId, SubmissionResponse, SubmissionState, ToolCallLocation, decode_path_escapes,
+};
+use agent::{
+    SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
+    SkillLoadingIssuesUpdated, ThreadSandbox, VerifiedSandboxStatus,
+};
+use agent_settings::UserAgentsMd;
+use agent_skills::MAX_SKILL_DESCRIPTION_LEN;
 use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCommentsBody};
 use editor::actions::OpenExcerpts;
+use sandbox::{SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
 
-use crate::StartThreadIn;
+use crate::completion_provider::{AvailableSkill, PromptLocalCommand, pluralize};
 use crate::message_editor::SharedSessionCapabilities;
-use gpui::{Corner, List};
-use heapless::Vec as ArrayVec;
-use language_model::{LanguageModelEffortLevel, Speed};
-use settings::update_settings_file;
-use ui::{ButtonLike, SplitButton, SplitButtonStyle, Tab};
-use workspace::SERIALIZATION_THROTTLE_TIME;
+use crate::ui::{
+    SandboxGroup, SandboxRow, SandboxSection, SandboxStatusTooltip, TerminalSandboxWarning,
+    TerminalToolHeader,
+};
+use crate::unicode_confusables;
 
+use db::kvp::KeyValueStore;
+use gpui::List;
+use gpui::Stateful;
+use gpui::TaskExt;
+use heapless::Vec as ArrayVec;
+use itertools::Itertools;
+use language_model::{
+    FastModeConfirmation, LanguageModel, LanguageModelEffortLevel, LanguageModelId,
+    LanguageModelProvider, LanguageModelProviderId, LanguageModelRegistry, Speed,
+};
+use notifications::status_toast::StatusToast;
+use project::ResolvedPath;
+use settings::{update_settings_file, update_settings_file_with_completion};
+use ui::{
+    ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
+    SplitButtonStyle, Tab, ToggleState,
+};
+use url::Url;
+use util::markdown::source_position_from_fragment;
+use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
+
+use super::elicitation::{
+    ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
+};
 use super::*;
+
+const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
 
 #[derive(Default)]
 struct ThreadFeedbackState {
@@ -161,13 +203,320 @@ impl ThreadFeedbackState {
     }
 }
 
+struct GeneratingSpinner {
+    variant: SpinnerVariant,
+}
+
+impl GeneratingSpinner {
+    fn new(variant: SpinnerVariant) -> Self {
+        Self { variant }
+    }
+}
+
+impl Render for GeneratingSpinner {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        SpinnerLabel::with_variant(self.variant).size(LabelSize::Small)
+    }
+}
+
+#[derive(IntoElement)]
+struct GeneratingSpinnerElement {
+    variant: SpinnerVariant,
+}
+
+impl GeneratingSpinnerElement {
+    fn new(variant: SpinnerVariant) -> Self {
+        Self { variant }
+    }
+}
+
+impl RenderOnce for GeneratingSpinnerElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let id = match self.variant {
+            SpinnerVariant::Dots => "generating-spinner-view",
+            SpinnerVariant::Sand => "confirmation-spinner-view",
+            _ => "spinner-view",
+        };
+        window.with_id(id, |window| {
+            window.use_state(cx, |_, _| GeneratingSpinner::new(self.variant))
+        })
+    }
+}
+
 pub enum AcpThreadViewEvent {
-    FirstSendRequested { content: Vec<acp::ContentBlock> },
+    Interacted,
 }
 
 impl EventEmitter<AcpThreadViewEvent> for ThreadView {}
 
-/// Tracks the user's permission dropdown selection state for a specific tool call.
+/// `cat -n`-style numbered code block, already stripped of its line-number
+/// prefixes and ready to render. Line numbers are guaranteed to be contiguous
+/// starting at `first_number`, so we only store the first number and the line
+/// count rather than allocating a per-line `Vec`.
+struct ParsedCatNumberedCode {
+    code: String,
+    first_number: u32,
+    line_count: usize,
+}
+
+fn parse_cat_numbered_markdown_code_block(markdown: &str) -> Option<ParsedCatNumberedCode> {
+    let (_tag, code) = parse_single_fenced_code_block(markdown)?;
+    parse_cat_numbered_code(code)
+}
+
+fn parse_single_fenced_code_block(markdown: &str) -> Option<(&str, &str)> {
+    let first_non_backtick = markdown.find(|character| character != '`')?;
+    if first_non_backtick < 3 {
+        return None;
+    }
+
+    let fence = &markdown[..first_non_backtick];
+    let after_opening_fence = &markdown[first_non_backtick..];
+    let tag_end = after_opening_fence.find('\n')?;
+    let tag = &after_opening_fence[..tag_end];
+    let after_tag = &after_opening_fence[tag_end + 1..];
+    let closing_fence = format!("\n{fence}\n");
+    let code = after_tag.strip_suffix(&closing_fence)?;
+    Some((tag, code))
+}
+
+/// Walks `code` exactly once: for each line it validates and strips the
+/// `NNN\t` prefix, then pushes the line's content into the accumulating
+/// code buffer (with `\n` between lines, no trailing newline). Verifies that
+/// the line numbers form a contiguous, increasing sequence.
+fn parse_cat_numbered_code(code: &str) -> Option<ParsedCatNumberedCode> {
+    if code.is_empty() {
+        return None;
+    }
+
+    let mut output = String::with_capacity(code.len());
+    let mut first_number = None;
+    let mut expected_number = None;
+    let mut line_count: usize = 0;
+    for raw_line in code.split_inclusive('\n') {
+        let line = strip_line_ending(raw_line);
+        let (number, text) = parse_cat_numbered_line(line)?;
+        if let Some(expected) = expected_number {
+            if number != expected {
+                return None;
+            }
+        } else {
+            first_number = Some(number);
+        }
+        expected_number = number.checked_add(1);
+        if line_count > 0 {
+            output.push('\n');
+        }
+        output.push_str(text);
+        line_count += 1;
+    }
+
+    Some(ParsedCatNumberedCode {
+        code: output,
+        first_number: first_number?,
+        line_count,
+    })
+}
+
+fn strip_line_ending(line: &str) -> &str {
+    let without_lf = line.strip_suffix('\n').unwrap_or(line);
+    without_lf.strip_suffix('\r').unwrap_or(without_lf)
+}
+
+fn parse_cat_numbered_line(line: &str) -> Option<(u32, &str)> {
+    let (prefix, text) = line.split_once('\t')?;
+    let number = prefix.trim();
+    if number.is_empty()
+        || !prefix
+            .chars()
+            .all(|character| character == ' ' || character.is_ascii_digit())
+    {
+        return None;
+    }
+
+    Some((number.parse().ok()?, text))
+}
+
+fn render_cat_numbered_code_block(
+    parsed: ParsedCatNumberedCode,
+    language: Option<Arc<Language>>,
+    markdown_style: MarkdownStyle,
+    copy_button_id: String,
+    cx: &App,
+) -> AnyElement {
+    use std::fmt::Write as _;
+
+    let ParsedCatNumberedCode {
+        code,
+        first_number,
+        line_count,
+    } = parsed;
+
+    // Line numbers are contiguous (verified during parsing), so the largest
+    // line number is `first_number + line_count - 1`. Sizing the gutter to
+    // that number's digit count means every rendered line contributes exactly
+    // `gutter_width` bytes to the gutter, plus a newline between adjacent
+    // lines.
+    let last_number = first_number
+        .saturating_add(u32::try_from(line_count.saturating_sub(1)).unwrap_or(u32::MAX));
+    let gutter_width = last_number.to_string().len().max(1);
+    let gutter_capacity = line_count * gutter_width + line_count.saturating_sub(1);
+
+    let mut gutter = String::with_capacity(gutter_capacity);
+    for i in 0..line_count {
+        if i > 0 {
+            gutter.push('\n');
+        }
+        let line_number = first_number.saturating_add(u32::try_from(i).unwrap_or(u32::MAX));
+        // Writes to a `String` are infallible, so the `Result` can be ignored.
+        let _ = write!(&mut gutter, "{line_number:>gutter_width$}");
+    }
+
+    let mut code_text_style = markdown_style.base_text_style.clone();
+    code_text_style.refine(&markdown_style.code_block.text);
+
+    let mut gutter_text_style = code_text_style.clone();
+    gutter_text_style.color = cx.theme().colors().text_muted;
+
+    let gutter_len = gutter.len();
+    let gutter = StyledText::new(gutter).with_runs(vec![gutter_text_style.to_run(gutter_len)]);
+
+    // Share `code` between syntax highlighting, the rendered `StyledText`, and
+    // the copy button via a single `SharedString` (cheap `Arc` clones) instead
+    // of cloning the underlying `String`.
+    let code: SharedString = code.into();
+    let code_runs = highlight_code_runs(&code, language.as_ref(), code_text_style, &markdown_style);
+    let code_text = StyledText::new(code.clone()).with_runs(code_runs);
+
+    let code_block_id = format!("read-file-code-block-{copy_button_id}");
+    let code_scroll_id = format!("read-file-code-scroll-{copy_button_id}");
+    let mut container = div()
+        .id(code_block_id)
+        .group("read-file-code-block")
+        .relative()
+        .w_full()
+        .whitespace_nowrap();
+    container.style().refine(&markdown_style.code_block);
+
+    // `overflow_x_scroll` only actually scrolls when the container is laid out
+    // as a flex container: in GPUI the default `Display` is `Block`, and a
+    // block-level child fills its parent's content width instead of overflowing
+    // it, so there is nothing for the scroll viewport to scroll. Using `flex()`
+    // on the scroll wrapper plus `flex_none()` on the inner item lets the inner
+    // item take its natural width (the unwrapped code), which is what overflows.
+    // `restrict_scroll_to_axis` then keeps vertical wheel events flowing through
+    // to the outer thread scroller. This mirrors the standard markdown
+    // code-block path in `crates/markdown/src/markdown.rs`.
+    let code_scroll = div()
+        .id(code_scroll_id)
+        .flex()
+        .flex_1()
+        .min_w_0()
+        .overflow_x_scroll()
+        .restrict_scroll_to_axis()
+        .child(div().flex_none().child(code_text));
+
+    container
+        .child(
+            h_flex()
+                .items_start()
+                .min_w_0()
+                .w_full()
+                .child(div().flex_none().pr_3().child(gutter))
+                .child(code_scroll),
+        )
+        .child(
+            h_flex()
+                .w_4()
+                .absolute()
+                .top_0()
+                .right_0()
+                .justify_end()
+                .visible_on_hover("read-file-code-block")
+                .child(CopyButton::new(copy_button_id, code).tooltip_label("Copy Code")),
+        )
+        .into_any_element()
+}
+
+fn highlight_code_runs(
+    code: &str,
+    language: Option<&Arc<Language>>,
+    code_text_style: TextStyle,
+    markdown_style: &MarkdownStyle,
+) -> Vec<TextRun> {
+    if code.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(language) = language else {
+        return vec![code_text_style.to_run(code.len())];
+    };
+
+    let mut runs = Vec::new();
+    let mut offset = 0;
+    for (range, highlight_id) in language.highlight_text(&Rope::from(code), 0..code.len()) {
+        if range.start > offset {
+            runs.push(code_text_style.to_run(range.start - offset));
+        }
+
+        let mut run_style = code_text_style.clone();
+        if let Some(highlight) = markdown_style.syntax.get(highlight_id).cloned() {
+            run_style = run_style.highlight(highlight);
+        }
+        runs.push(run_style.to_run(range.len()));
+        offset = range.end;
+    }
+
+    if offset < code.len() {
+        runs.push(code_text_style.to_run(code.len() - offset));
+    }
+
+    runs
+}
+
+#[cfg(test)]
+mod numbered_code_block_tests {
+    use super::*;
+
+    #[test]
+    fn parses_cat_numbered_markdown_code_block() {
+        let parsed = parse_cat_numbered_markdown_code_block(
+            "```rs zed/crates/example.rs\n     2\tfn main() {\n     3\t    println!(\"hi\");\n     4\t}\n```\n",
+        )
+        .expect("cat-numbered block should parse");
+
+        assert_eq!(parsed.line_count, 3);
+        assert_eq!(parsed.first_number, 2);
+        assert_eq!(parsed.code, "fn main() {\n    println!(\"hi\");\n}");
+    }
+
+    #[test]
+    fn parses_cat_numbered_code_with_crlf_line_endings() {
+        let parsed = parse_cat_numbered_code("     1\tline one\r\n     2\tline two\r\n")
+            .expect("crlf-terminated cat-numbered code should parse");
+
+        assert_eq!(parsed.line_count, 2);
+        assert_eq!(parsed.first_number, 1);
+        assert_eq!(parsed.code, "line one\nline two");
+    }
+
+    #[test]
+    fn rejects_non_cat_numbered_code_block() {
+        assert!(parse_cat_numbered_markdown_code_block("```rs\nfn main() {}\n```\n").is_none());
+    }
+
+    #[test]
+    fn rejects_non_contiguous_cat_numbers() {
+        assert!(
+            parse_cat_numbered_markdown_code_block(
+                "```rs\n     2\tlet a = 1;\n     4\tlet b = 2;\n```\n"
+            )
+            .is_none()
+        );
+    }
+}
+
+/// Tracks the user's permission dropdown selection state for a specific request.
 ///
 /// Default (no entry in the map) means the last dropdown choice is selected,
 /// which is typically "Only this time".
@@ -206,7 +555,7 @@ impl PermissionSelection {
         }
     }
 
-    fn toggle_pattern(&mut self, index: usize) {
+    pub(super) fn toggle_pattern(&mut self, index: usize) {
         if let Self::SelectedPatterns(checked) = self {
             if let Some(pos) = checked.iter().position(|&i| i == index) {
                 checked.swap_remove(pos);
@@ -218,18 +567,21 @@ impl PermissionSelection {
 }
 
 pub struct ThreadView {
-    pub id: acp::SessionId,
-    pub parent_id: Option<acp::SessionId>,
+    pub(crate) root_thread_id: ThreadId,
+    pub session_id: acp_v2::SessionId,
+    pub parent_session_id: Option<acp_v2::SessionId>,
     pub thread: Entity<AcpThread>,
     pub(crate) conversation: Entity<super::Conversation>,
     pub server_view: WeakEntity<ConversationView>,
     pub agent_icon: IconName,
     pub agent_icon_from_external_svg: Option<SharedString>,
     pub agent_id: AgentId,
+    pub agent_display_name: SharedString,
     pub focus_handle: FocusHandle,
     pub workspace: WeakEntity<Workspace>,
     pub entry_view_state: Entity<EntryViewState>,
     pub title_editor: Entity<Editor>,
+    title_editor_sync_version: Option<(gpui::EntityId, clock::Global)>,
     pub config_options_view: Option<Entity<ConfigOptionsView>>,
     pub mode_selector: Option<Entity<ModeSelector>>,
     pub model_selector: Option<Entity<ModelSelectorPopover>>,
@@ -243,54 +595,69 @@ pub struct ThreadView {
     thread_feedback: ThreadFeedbackState,
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
-    /// Tracks which tool calls have their content/output expanded.
-    /// Used for showing/hiding tool call results, terminal output, etc.
-    pub expanded_tool_calls: HashSet<agent_client_protocol::ToolCallId>,
-    pub expanded_tool_call_raw_inputs: HashSet<agent_client_protocol::ToolCallId>,
-    pub expanded_thinking_blocks: HashSet<(usize, usize)>,
-    auto_expanded_thinking_block: Option<(usize, usize)>,
-    pub subagent_scroll_handles: RefCell<HashMap<agent_client_protocol::SessionId, ScrollHandle>>,
+    pub expanded_tool_call_raw_inputs: HashSet<acp_v2::ToolCallId>,
+    collapsed_sandbox_authorization_details: HashSet<acp_v2::ToolCallId>,
+    collapsed_sandbox_network_details: HashSet<acp_v2::ToolCallId>,
+    /// Sandbox escalation prompts whose "surprising Unicode" warning the user
+    /// has explicitly acknowledged. Until a prompt's tool call is in this set,
+    /// its allow buttons stay disabled. See [`Self::sandbox_confusable_findings`].
+    acknowledged_confusable_warnings: HashSet<acp_v2::ToolCallId>,
+    pub subagent_scroll_handles: RefCell<HashMap<acp_v2::SessionId, ScrollHandle>>,
     pub edits_expanded: bool,
     pub plan_expanded: bool,
     pub queue_expanded: bool,
     pub editor_expanded: bool,
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
-    pub local_queued_messages: Vec<QueuedMessage>,
-    pub queued_message_editors: Vec<Entity<MessageEditor>>,
-    pub queued_message_editor_subscriptions: Vec<Subscription>,
-    pub last_synced_queue_length: usize,
+    pub message_queue: MessageQueue,
     pub turn_fields: TurnFields,
-    pub discarded_partial_edits: HashSet<agent_client_protocol::ToolCallId>,
+    pub discarded_partial_edits: HashSet<acp_v2::ToolCallId>,
     pub is_loading_contents: bool,
     pub new_server_version_available: Option<SharedString>,
     pub resumed_without_history: bool,
-    pub(crate) permission_selections:
-        HashMap<agent_client_protocol::ToolCallId, PermissionSelection>,
-    pub resume_thread_metadata: Option<AgentSessionInfo>,
+    elicitation_form_states: HashMap<ElicitationEntryId, ElicitationFormState>,
     pub _cancel_task: Option<Task<()>>,
     _save_task: Option<Task<()>>,
     _draft_resolve_task: Option<Task<()>>,
-    pub skip_queue_processing_count: usize,
-    pub user_interrupted_generation: bool,
-    pub can_fast_track_queue: bool,
+    _sandbox_status_refresh_task: Option<Task<()>>,
     pub hovered_edited_file_buttons: Option<usize>,
-    pub in_flight_prompt: Option<Vec<acp::ContentBlock>>,
+    pub current_submission: Option<SubmissionId>,
     pub _subscriptions: Vec<Subscription>,
     pub message_editor: Entity<MessageEditor>,
     pub add_context_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub thinking_effort_menu_handle: PopoverMenuHandle<ContextMenu>,
+    pub fast_mode_menu_handle: PopoverMenuHandle<ContextMenu>,
     pub project: WeakEntity<Project>,
-    pub recent_history_entries: Vec<AgentSessionInfo>,
-    pub hovered_recent_history_item: Option<usize>,
+    /// Cache + worktree snapshot for resolving paths in markdown code spans.
+    /// Cloned from the parent `ConversationView` so the cache is shared and the
+    /// snapshot stays in sync via the parent's project-event subscription.
+    pub(crate) code_span_resolver: AgentCodeSpanResolver,
     pub show_external_source_prompt_warning: bool,
     pub show_codex_windows_warning: bool,
-    pub history: Option<Entity<ThreadHistory>>,
-    pub _history_subscription: Option<Subscription>,
+    sandbox_status: Option<VerifiedSandboxStatus>,
+    sandbox_status_key: Option<SandboxStatusKey>,
+    pending_sandbox_status_key: Option<SandboxStatusKey>,
+    pub multi_root_callout_dismissed: bool,
+    pub generating_indicator_in_list: bool,
+    pub skill_loading_issues: Vec<SkillLoadingIssue>,
+    /// Issues the user has explicitly dismissed. Each entry is matched against
+    /// emitted issues by full equality; when an issue no longer appears in the
+    /// latest replacement list (because the underlying file was fixed/removed), it's
+    /// dropped from this set so a future regression of the same kind would
+    /// re-show.
+    dismissed_skill_loading_issues: HashSet<SkillLoadingIssue>,
+    pub(crate) thread_search_bar: Option<Entity<super::thread_search_bar::ThreadSearchBar>>,
+    pub(crate) thread_search_visible: bool,
 }
 impl Focusable for ThreadView {
-    fn focus_handle(&self, cx: &App) -> FocusHandle {
-        if self.parent_id.is_some() {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl ThreadView {
+    pub(crate) fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
+        if self.parent_session_id.is_some() {
             self.focus_handle.clone()
         } else {
             self.active_editor(cx).focus_handle(cx)
@@ -306,11 +673,112 @@ pub struct TurnFields {
     pub turn_generation: usize,
     pub turn_started_at: Option<Instant>,
     pub turn_tokens: Option<u64>,
+    pub reported_activity_generation: Option<u64>,
+}
+
+/// How a tool call is rendered relative to its surroundings.
+///
+/// `Standalone` draws its own border/margin/location header. `Embedded` is
+/// hosted by a container that provides its own framing (e.g. the subagent
+/// card). `Floating` is like `Embedded`, but used for the floating
+/// awaiting-permission row above the message editor: the tool call's content
+/// is height-capped and scrollable so the row can never grow to consume the
+/// entire panel and squeeze the conversation list out of view.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum ToolCallLayout {
+    Standalone,
+    Embedded,
+    Floating,
+}
+
+impl ToolCallLayout {
+    /// Stable discriminant used to disambiguate element ids when the same tool
+    /// call is rendered in more than one layout at once (e.g. inline in the
+    /// list *and* in the floating awaiting-permission row).
+    fn id_str(self) -> &'static str {
+        match self {
+            ToolCallLayout::Standalone => "standalone",
+            ToolCallLayout::Embedded => "embedded",
+            ToolCallLayout::Floating => "floating",
+        }
+    }
+}
+
+fn full_path_for_empty_project_path(file: &dyn language::File, cx: &App) -> Option<String> {
+    if file.path().file_name().is_some() {
+        return None;
+    }
+
+    let full_path = file.full_path(cx).display().to_string();
+    (!full_path.is_empty()).then_some(full_path)
+}
+
+fn skill_issue_file_label(path: &std::path::Path) -> String {
+    let file_name = path.file_name().and_then(|name| name.to_str());
+    let parent_name = path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str());
+
+    match (parent_name, file_name) {
+        (Some(parent_name), Some(file_name)) => format!("{parent_name}/{file_name}"),
+        (_, Some(file_name)) => file_name.to_string(),
+        _ => path.display().to_string(),
+    }
+}
+
+pub fn open_markdown_in_workspace(
+    title: String,
+    markdown: String,
+    workspace: Entity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Result<()>> {
+    let markdown_language_task = workspace
+        .read(cx)
+        .app_state()
+        .languages
+        .language_for_name("Markdown");
+    let project = workspace.read(cx).project().clone();
+
+    window.spawn(cx, async move |cx| {
+        let markdown_language = markdown_language_task.await?;
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.create_buffer(Some(markdown_language), false, cx)
+            })
+            .await?;
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_text(markdown, cx);
+            buffer.set_capability(language::Capability::ReadWrite, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx).with_title(title.clone()));
+
+            workspace.add_item_to_active_pane(
+                Box::new(cx.new(|cx| {
+                    let mut editor =
+                        Editor::for_multibuffer(buffer, Some(project.clone()), window, cx);
+                    editor.set_breadcrumb_header(title);
+                    editor.disable_mouse_wheel_zoom();
+                    editor
+                })),
+                None,
+                true,
+                window,
+                cx,
+            );
+        })?;
+        anyhow::Ok(())
+    })
 }
 
 impl ThreadView {
     pub(crate) fn new(
-        parent_id: Option<acp::SessionId>,
+        root_thread_id: ThreadId,
         thread: Entity<AcpThread>,
         conversation: Entity<super::Conversation>,
         server_view: WeakEntity<ConversationView>,
@@ -328,23 +796,21 @@ impl ThreadView {
         session_capabilities: SharedSessionCapabilities,
         resumed_without_history: bool,
         project: WeakEntity<Project>,
+        code_span_resolver: AgentCodeSpanResolver,
         thread_store: Option<Entity<ThreadStore>>,
-        history: Option<Entity<ThreadHistory>>,
-        prompt_store: Option<Entity<PromptStore>>,
         initial_content: Option<AgentInitialContent>,
         mut subscriptions: Vec<Subscription>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let id = thread.read(cx).session_id().clone();
+        let session_id = thread.read(cx).session_id().clone();
+        let parent_session_id = thread.read(cx).parent_session_id().cloned();
 
-        let placeholder = placeholder_text(agent_display_name.as_ref(), false);
+        subscriptions.push(cx.observe(&thread, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
 
-        let history_subscription = history.as_ref().map(|h| {
-            cx.observe(h, |this, history, cx| {
-                this.update_recent_history_from_cache(&history, cx);
-            })
-        });
+        let has_slash_completions = session_capabilities.read().has_slash_completions();
+        let placeholder = placeholder_text(agent_display_name.as_ref(), has_slash_completions);
 
         let mut should_auto_submit = false;
         let mut show_external_source_prompt_warning = false;
@@ -354,8 +820,6 @@ impl ThreadView {
                 workspace.clone(),
                 project.clone(),
                 thread_store,
-                history.as_ref().map(|h| h.downgrade()),
-                prompt_store,
                 session_capabilities.clone(),
                 agent_id.clone(),
                 &placeholder,
@@ -366,33 +830,42 @@ impl ThreadView {
                 window,
                 cx,
             );
-            if let Some(content) = initial_content {
+            let content_blocks = if let Some(content) = initial_content {
                 match content {
                     AgentInitialContent::ThreadSummary { session_id, title } => {
                         editor.insert_thread_summary(session_id, title, window, cx);
+                        None
                     }
                     AgentInitialContent::ContentBlock {
                         blocks,
                         auto_submit,
                     } => {
                         should_auto_submit = auto_submit;
-                        editor.set_message(blocks, window, cx);
+                        Some(blocks)
                     }
                     AgentInitialContent::FromExternalSource(prompt) => {
                         show_external_source_prompt_warning = true;
                         // SECURITY: Be explicit about not auto submitting prompt from external source.
                         should_auto_submit = false;
-                        editor.set_message(
-                            vec![acp::ContentBlock::Text(acp::TextContent::new(
-                                prompt.into_string(),
-                            ))],
-                            window,
-                            cx,
-                        );
+                        Some(vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                            prompt.into_string(),
+                        ))])
                     }
                 }
-            } else if let Some(draft) = thread.read(cx).draft_prompt() {
-                editor.set_message(draft.to_vec(), window, cx);
+            } else {
+                thread.read(cx).draft_prompt().map(|draft| draft.to_vec())
+            };
+            if let Some(blocks) = content_blocks {
+                if blocks.iter().all(acp_thread::content::can_convert_to_v1) {
+                    editor.set_message(blocks, window, cx);
+                } else {
+                    should_auto_submit = false;
+                    thread.update(cx, |thread, cx| {
+                        thread.set_draft_prompt(Some(blocks.clone()), cx);
+                    });
+                    editor.set_read_only(true, cx);
+                    editor.set_source_message(blocks, window, cx);
+                }
             }
             editor
         });
@@ -401,16 +874,43 @@ impl ThreadView {
             && project.upgrade().is_some_and(|p| p.read(cx).is_local())
             && agent_id.as_ref() == "Codex";
 
-        let title_editor = {
-            let can_edit = thread.update(cx, |thread, cx| thread.can_set_title(cx));
+        if let Some(project) = project.upgrade() {
+            subscriptions.push(cx.subscribe(&project, {
+                let resolver = code_span_resolver.clone();
+                move |_this: &mut Self, _project, event: &project::Event, cx| {
+                    if matches!(
+                        event,
+                        project::Event::WorktreeAdded(_)
+                            | project::Event::WorktreeRemoved(_)
+                            | project::Event::WorktreeUpdatedEntries(_, _)
+                    ) {
+                        resolver.clear_cache();
+                        cx.notify();
+                    }
+                }
+            }));
+        }
+
+        let (title_editor, title_editor_sync_version) = {
+            let metadata = ThreadMetadataStore::try_global(cx)
+                .and_then(|store| store.read(cx).entry(root_thread_id).cloned());
+            let initial_title = if parent_session_id.is_none() {
+                metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.title_override.clone())
+            } else {
+                None
+            }
+            .or_else(|| thread.read(cx).title())
+            .unwrap_or_else(|| DEFAULT_THREAD_TITLE.into());
             let editor = cx.new(|cx| {
                 let mut editor = Editor::single_line(window, cx);
-                editor.set_text(thread.read(cx).title(), window, cx);
-                editor.set_read_only(!can_edit);
+                editor.set_text(initial_title, window, cx);
                 editor
             });
+            let version = Self::title_editor_version(editor.read(cx), cx);
             subscriptions.push(cx.subscribe_in(&editor, window, Self::handle_title_editor_event));
-            editor
+            (editor, version)
         };
 
         subscriptions.push(cx.subscribe_in(
@@ -425,7 +925,61 @@ impl ThreadView {
             Self::handle_message_editor_event,
         ));
 
+        // If this thread is backed by a NativeAgent, listen for skill loading
+        // issues so we can surface them as banners. The agent emits a single
+        // replacement-style event per project refresh, so we overwrite our
+        // local list rather than appending — this also clears stale issues
+        // once a user resolves them.
+        if let Some(native_connection) = thread
+            .read(cx)
+            .connection()
+            .clone()
+            .downcast::<agent::NativeAgentConnection>()
+        {
+            let project_id = thread.read(cx).project().entity_id();
+            subscriptions.push(cx.subscribe(
+                &native_connection.0,
+                move |this: &mut Self, _agent, event: &SkillLoadingIssuesUpdated, cx| {
+                    if event.project_id != project_id {
+                        return;
+                    }
+                    // Drop dismissals for issues that no longer appear in the emitted
+                    // list — the underlying file must have been fixed or removed, so a
+                    // future regression should re-show.
+                    this.dismissed_skill_loading_issues
+                        .retain(|dismissed| event.issues.contains(dismissed));
+
+                    // Show only issues that haven't been dismissed.
+                    this.skill_loading_issues = event
+                        .issues
+                        .iter()
+                        .filter(|issue| !this.dismissed_skill_loading_issues.contains(issue))
+                        .cloned()
+                        .collect();
+                    cx.notify();
+                },
+            ));
+
+            // A "no model selected" error is stale as soon as the thread has a
+            // usable model
+            if let Some(native_thread) = native_connection.thread(thread.read(cx).session_id(), cx)
+            {
+                subscriptions.push(cx.subscribe(
+                    &native_thread,
+                    |this: &mut Self, _thread, _event: &agent::ModelChanged, cx| {
+                        if matches!(this.thread_error, Some(ThreadError::NoModelSelected)) {
+                            this.clear_thread_error(cx);
+                        }
+                    },
+                ));
+            }
+        }
+
         subscriptions.push(cx.observe(&message_editor, |this, editor, cx| {
+            if editor.read(cx).editor().read(cx).read_only(cx) {
+                this._draft_resolve_task.take();
+                return;
+            }
             let is_empty = editor.read(cx).text(cx).is_empty();
             let draft_contents_task = if is_empty {
                 None
@@ -440,8 +994,11 @@ impl ThreadView {
                     None
                 };
                 this.update(cx, |this, cx| {
-                    this.thread.update(cx, |thread, _cx| {
-                        thread.set_draft_prompt(draft);
+                    if this.message_editor.read(cx).editor().read(cx).read_only(cx) {
+                        return;
+                    }
+                    this.thread.update(cx, |thread, cx| {
+                        thread.set_draft_prompt(draft, cx);
                     });
                     this.schedule_save(cx);
                 })
@@ -449,14 +1006,11 @@ impl ThreadView {
             }));
         }));
 
-        let recent_history_entries = history
-            .as_ref()
-            .map(|h| h.read(cx).get_recent_sessions(3))
-            .unwrap_or_default();
-
+        let current_submission = thread.read(cx).latest_submission_id();
         let mut this = Self {
-            id,
-            parent_id,
+            root_thread_id,
+            session_id,
+            parent_session_id,
             focus_handle: cx.focus_handle(),
             thread,
             conversation,
@@ -464,9 +1018,11 @@ impl ThreadView {
             agent_icon,
             agent_icon_from_external_svg,
             agent_id,
+            agent_display_name,
             workspace,
             entry_view_state,
             title_editor,
+            title_editor_sync_version,
             config_options_view,
             mode_selector,
             model_selector,
@@ -482,10 +1038,10 @@ impl ThreadView {
             token_limit_callout_dismissed: false,
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
-            expanded_tool_calls: HashSet::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
-            expanded_thinking_blocks: HashSet::default(),
-            auto_expanded_thinking_block: None,
+            collapsed_sandbox_authorization_details: HashSet::default(),
+            collapsed_sandbox_network_details: HashSet::default(),
+            acknowledged_confusable_warnings: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
             edits_expanded: false,
             plan_expanded: false,
@@ -493,37 +1049,44 @@ impl ThreadView {
             editor_expanded: false,
             should_be_following: false,
             editing_message: None,
-            local_queued_messages: Vec::new(),
-            queued_message_editors: Vec::new(),
-            queued_message_editor_subscriptions: Vec::new(),
-            last_synced_queue_length: 0,
+            message_queue: MessageQueue::default(),
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
             is_loading_contents: false,
             new_server_version_available: None,
-            permission_selections: HashMap::default(),
-            resume_thread_metadata: None,
+            elicitation_form_states: HashMap::default(),
             _cancel_task: None,
             _save_task: None,
             _draft_resolve_task: None,
-            skip_queue_processing_count: 0,
-            user_interrupted_generation: false,
-            can_fast_track_queue: false,
+            _sandbox_status_refresh_task: None,
             hovered_edited_file_buttons: None,
-            in_flight_prompt: None,
+            current_submission,
             message_editor,
             add_context_menu_handle: PopoverMenuHandle::default(),
             thinking_effort_menu_handle: PopoverMenuHandle::default(),
+            fast_mode_menu_handle: PopoverMenuHandle::default(),
             project,
-            recent_history_entries,
-            hovered_recent_history_item: None,
+            code_span_resolver,
             show_external_source_prompt_warning,
-            history,
-            _history_subscription: history_subscription,
             show_codex_windows_warning,
+            sandbox_status: None,
+            sandbox_status_key: None,
+            pending_sandbox_status_key: None,
+            multi_root_callout_dismissed: false,
+            generating_indicator_in_list: false,
+            skill_loading_issues: Vec::new(),
+            dismissed_skill_loading_issues: HashSet::default(),
+            thread_search_bar: None,
+            thread_search_visible: false,
         };
+
+        this.sync_reported_activity(cx);
+        this.sync_generating_indicator(cx);
+        this.sync_editor_mode(cx);
+        this.sync_existing_elicitation_states(window, cx);
         let list_state_for_scroll = this.list_state.clone();
         let thread_view = cx.entity().downgrade();
+
         this.list_state
             .set_scroll_handler(move |_event, _window, cx| {
                 let list_state = list_state_for_scroll.clone();
@@ -573,16 +1136,80 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The three skill-watcher trigger points all live here:
+        // - `Focus` fires when the user clicks into the input box.
+        // - `SlashAutocompleteOpened` fires when the completion
+        //   provider is asked for slash commands.
+        // - `Send` fires when the user submits the conversation.
+        // All three triggers are idempotent; firing the same one
+        // repeatedly is a no-op once a scan or watch is active.
+        if matches!(
+            event,
+            MessageEditorEvent::Focus
+                | MessageEditorEvent::SlashAutocompleteOpened
+                | MessageEditorEvent::Send
+        ) {
+            if let Some(connection) = self.as_native_connection(cx) {
+                connection.ensure_skills_scan_started(cx);
+                if let Some(project) = self.project.upgrade() {
+                    connection.refresh_skills_for_project(project, cx);
+                }
+            }
+        }
+
         match event {
             MessageEditorEvent::Send => self.send(window, cx),
             MessageEditorEvent::SendImmediately => self.interrupt_and_send(window, cx),
-            MessageEditorEvent::Cancel => self.cancel_generation(cx),
+            MessageEditorEvent::Cancel => {
+                if !self.close_thread_search(window, cx) {
+                    self.cancel_generation(cx);
+                }
+            }
             MessageEditorEvent::Focus => {
                 self.cancel_editing(&Default::default(), window, cx);
             }
             MessageEditorEvent::LostFocus => {}
-            MessageEditorEvent::InputAttempted(_) => {}
+            MessageEditorEvent::SlashAutocompleteOpened => {}
+            MessageEditorEvent::LocalCommandInvoked(command) => {
+                self.run_local_command(*command, window, cx);
+            }
+            MessageEditorEvent::InputAttempted { .. } => {}
+            MessageEditorEvent::Edited => {}
         }
+    }
+
+    fn run_local_command(
+        &mut self,
+        command: PromptLocalCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            PromptLocalCommand::ThumbsUp => {
+                self.handle_feedback_click(ThreadFeedback::Positive, window, cx);
+                self.show_local_command_toast("Thanks for your feedback!", cx);
+            }
+            PromptLocalCommand::ThumbsDown => {
+                self.handle_feedback_click(ThreadFeedback::Negative, window, cx);
+            }
+        }
+    }
+
+    fn show_local_command_toast(&self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        // Shown after positive feedback, replacing the inline button state.
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            let toast = StatusToast::new(message, cx, |this, _cx| {
+                this.icon(
+                    Icon::new(IconName::Check)
+                        .size(IconSize::Small)
+                        .color(Color::Success),
+                )
+            });
+            workspace.toggle_status_toast(toast, cx);
+        });
     }
 
     pub(crate) fn as_native_connection(
@@ -606,7 +1233,12 @@ impl ThreadView {
         &self,
         message_editor: &Entity<MessageEditor>,
         cx: &mut App,
-    ) -> Task<Result<(Vec<acp::ContentBlock>, Vec<Entity<Buffer>>)>> {
+    ) -> Task<Result<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>)>> {
+        if message_editor.read(cx).editor().read(cx).read_only(cx) {
+            return Task::ready(Err(anyhow!(
+                "This draft contains unsupported content and cannot be edited or sent. Discard the draft to write a new message."
+            )));
+        }
         let expand = self.as_native_thread(cx).is_some_and(|thread| {
             let thread = thread.read(cx);
             AgentSettings::get_global(cx)
@@ -633,7 +1265,24 @@ impl ThreadView {
     }
 
     fn is_subagent(&self) -> bool {
-        self.parent_id.is_some()
+        self.parent_session_id.is_some()
+    }
+
+    pub(super) fn can_edit_user_message(&self, index: usize, cx: &App) -> bool {
+        let thread = self.thread.read(cx);
+        let Some(message) = thread
+            .entries()
+            .get(index)
+            .and_then(|entry| entry.user_message())
+        else {
+            return false;
+        };
+        thread.can_rewind_to(message.client_id.as_ref(), cx)
+            && message
+                .content
+                .source_blocks()
+                .iter()
+                .all(acp_thread::content::can_convert_to_v1)
     }
 
     /// Returns the currently active editor, either for a message that is being
@@ -654,14 +1303,7 @@ impl ThreadView {
     }
 
     pub fn has_queued_messages(&self) -> bool {
-        !self.local_queued_messages.is_empty()
-    }
-
-    pub fn is_imported_thread(&self, cx: &App) -> bool {
-        let Some(thread) = self.as_native_thread(cx) else {
-            return false;
-        };
-        thread.read(cx).is_imported()
+        !self.message_queue.is_empty()
     }
 
     // events
@@ -676,23 +1318,25 @@ impl ThreadView {
         match &event.view_event {
             ViewEvent::NewDiff(tool_call_id) => {
                 if AgentSettings::get_global(cx).expand_edit_card {
-                    self.expanded_tool_calls.insert(tool_call_id.clone());
+                    self.entry_view_state.update(cx, |state, _cx| {
+                        state.expand_tool_call(tool_call_id.clone());
+                    });
                 }
             }
             ViewEvent::NewTerminal(tool_call_id) => {
                 if AgentSettings::get_global(cx).expand_terminal_card {
-                    self.expanded_tool_calls.insert(tool_call_id.clone());
+                    self.entry_view_state.update(cx, |state, _cx| {
+                        state.expand_tool_call(tool_call_id.clone());
+                    });
                 }
             }
             ViewEvent::TerminalMovedToBackground(tool_call_id) => {
-                self.expanded_tool_calls.remove(tool_call_id);
+                self.entry_view_state.update(cx, |state, _cx| {
+                    state.collapse_tool_call(tool_call_id);
+                });
             }
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::Focus) => {
-                if let Some(AgentThreadEntry::UserMessage(user_message)) =
-                    self.thread.read(cx).entries().get(event.entry_index)
-                    && user_message.id.is_some()
-                    && !self.is_subagent()
-                {
+                if self.can_edit_user_message(event.entry_index, cx) {
                     self.editing_message = Some(event.entry_index);
                     cx.notify();
                 }
@@ -700,8 +1344,7 @@ impl ThreadView {
             ViewEvent::MessageEditorEvent(editor, MessageEditorEvent::LostFocus) => {
                 if let Some(AgentThreadEntry::UserMessage(user_message)) =
                     self.thread.read(cx).entries().get(event.entry_index)
-                    && user_message.id.is_some()
-                    && !self.is_subagent()
+                    && self.can_edit_user_message(event.entry_index, cx)
                 {
                     if editor.read(cx).text(cx).as_str() == user_message.content.to_markdown(cx) {
                         self.editing_message = None;
@@ -711,14 +1354,18 @@ impl ThreadView {
             }
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::SendImmediately) => {}
             ViewEvent::MessageEditorEvent(editor, MessageEditorEvent::Send) => {
-                if !self.is_subagent() {
+                if self.can_edit_user_message(event.entry_index, cx) {
                     self.regenerate(event.entry_index, editor.clone(), window, cx);
                 }
             }
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::Cancel) => {
                 self.cancel_editing(&Default::default(), window, cx);
             }
-            ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::InputAttempted(_)) => {}
+            ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::SlashAutocompleteOpened) => {
+            }
+            ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::LocalCommandInvoked(_)) => {}
+            ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::Edited) => {}
+            ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::InputAttempted { .. }) => {}
             ViewEvent::OpenDiffLocation {
                 path,
                 position,
@@ -786,6 +1433,12 @@ impl ThreadView {
     // turns
 
     pub fn start_turn(&mut self, cx: &mut Context<Self>) -> usize {
+        // A previous response may have settled while the new prompt's contents were loading.
+        self.thread_error.take();
+        self.initialize_turn(cx)
+    }
+
+    fn initialize_turn(&mut self, cx: &mut Context<Self>) -> usize {
         self.turn_fields.turn_generation += 1;
         let generation = self.turn_fields.turn_generation;
         self.turn_fields.turn_started_at = Some(Instant::now());
@@ -800,13 +1453,10 @@ impl ThreadView {
                 }
             }
         }));
-        if self.parent_id.is_none() {
-            self.suppress_merge_conflict_notification(cx);
-        }
         generation
     }
 
-    pub fn stop_turn(&mut self, generation: usize, cx: &mut Context<Self>) {
+    pub fn stop_turn(&mut self, generation: usize, _cx: &mut Context<Self>) {
         if self.turn_fields.turn_generation != generation {
             return;
         }
@@ -817,33 +1467,301 @@ impl ThreadView {
             .map(|started| started.elapsed());
         self.turn_fields.last_turn_tokens = self.turn_fields.turn_tokens.take();
         self.turn_fields._turn_timer_task = None;
-        if self.parent_id.is_none() {
-            self.unsuppress_merge_conflict_notification(cx);
+    }
+
+    pub(crate) fn sync_reported_activity(&mut self, cx: &mut Context<Self>) {
+        let thread = self.thread.read(cx);
+        if !thread.uses_reported_activity() {
+            return;
+        }
+        let activity = thread.foreground_activity();
+        let activity_generation = thread.activity_generation();
+        let started_at = thread.activity_started_at();
+        let duration = thread.activity_duration();
+
+        if activity != ForegroundActivity::Idle {
+            if self.turn_fields.reported_activity_generation != Some(activity_generation) {
+                self.initialize_turn(cx);
+                self.turn_fields.turn_started_at = started_at;
+                self.turn_fields.reported_activity_generation = Some(activity_generation);
+            }
+        } else {
+            if self.turn_fields.turn_started_at.is_some() {
+                self.stop_turn(self.turn_fields.turn_generation, cx);
+            }
+            if self.turn_fields.reported_activity_generation != Some(activity_generation) {
+                self.turn_fields.last_turn_tokens = None;
+            }
+            self.turn_fields.reported_activity_generation = Some(activity_generation);
+            self.turn_fields.last_turn_duration = duration;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn report_activity_completion(
+        &self,
+        stop_reason: &Option<acp_v2::StopReason>,
+        duration: Option<Duration>,
+        cx: &App,
+    ) {
+        let thread = self.thread.read(cx);
+        telemetry::event!(
+            "Agent Turn Completed",
+            agent = thread.connection().telemetry_id(),
+            session = thread.session_id().clone(),
+            parent_session_id = thread.parent_session_id().map(|id| id.to_string()),
+            model = self.current_model_id(cx),
+            mode = self.current_mode_id(cx),
+            status = Self::activity_completion_status(stop_reason.as_ref()),
+            turn_time_ms = duration.unwrap_or_default().as_millis(),
+            side = crate::agent_sidebar_side(cx)
+        );
+    }
+
+    fn activity_completion_status(stop_reason: Option<&acp_v2::StopReason>) -> &'static str {
+        match stop_reason {
+            Some(acp_v2::StopReason::EndTurn) => "success",
+            Some(acp_v2::StopReason::Cancelled) => "cancelled",
+            Some(
+                acp_v2::StopReason::MaxTokens
+                | acp_v2::StopReason::MaxTurnRequests
+                | acp_v2::StopReason::Refusal
+                | acp_v2::StopReason::Error(_),
+            ) => "failure",
+            _ => "unknown",
         }
     }
 
-    fn suppress_merge_conflict_notification(&self, cx: &mut Context<Self>) {
-        self.workspace
-            .update(cx, |workspace, cx| {
-                workspace.suppress_notification(&workspace::merge_conflict_notification_id(), cx);
-            })
-            .ok();
+    pub(crate) fn in_flight_prompt(&self, cx: &App) -> Option<Arc<[acp_v2::ContentBlock]>> {
+        let record = self.thread.read(cx);
+        let record = record.submission(self.current_submission?)?;
+        (!matches!(record.state, SubmissionState::Completed)).then(|| record.content.clone())
     }
 
-    fn unsuppress_merge_conflict_notification(&self, cx: &mut Context<Self>) {
-        self.workspace
-            .update(cx, |workspace, _cx| {
-                workspace.unsuppress(workspace::merge_conflict_notification_id());
+    fn submission_text_parts(content: &[acp_v2::ContentBlock]) -> impl Iterator<Item = &str> {
+        content.iter().map(|block| match block {
+            acp_v2::ContentBlock::Text(text) => text.text.as_str(),
+            acp_v2::ContentBlock::ResourceLink(link) => link.name.as_str(),
+            acp_v2::ContentBlock::Resource(resource) => match &resource.resource {
+                acp_v2::EmbeddedResourceResource::TextResourceContents(resource) => {
+                    resource.uri.as_str()
+                }
+                acp_v2::EmbeddedResourceResource::BlobResourceContents(resource) => {
+                    resource.uri.as_str()
+                }
+                _ => "[Resource attachment]",
+            },
+            acp_v2::ContentBlock::Image(_) => "[Image attachment]",
+            acp_v2::ContentBlock::Audio(_) => "[Audio attachment]",
+            _ => "[Unsupported attachment]",
+        })
+    }
+
+    fn restore_submission(
+        &mut self,
+        submission_id: SubmissionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.message_editor.read(cx).text(cx).is_empty() {
+            return;
+        }
+        let content = self
+            .thread
+            .read(cx)
+            .submission(submission_id)
+            .and_then(|record| {
+                matches!(
+                    record.state,
+                    SubmissionState::Failed(_) | SubmissionState::Cancelled
+                )
+                .then(|| record.content.to_vec())
+            });
+        if let Some(content) = content {
+            if !content.iter().all(acp_thread::content::can_convert_to_v1) {
+                self.handle_thread_error(
+                    anyhow!(
+                        "This saved submission contains unsupported content and cannot be restored. The original submission has been kept."
+                    ),
+                    cx,
+                );
+                return;
+            }
+            self.message_editor.update(cx, |editor, cx| {
+                editor.set_message(content, window, cx);
+            });
+            // The editor is not a lossless ACP round trip. Keep the original until explicit discard.
+            cx.notify();
+        }
+    }
+
+    fn render_recoverable_submissions(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let submissions = {
+            let thread = self.thread.read(cx);
+            if !thread.uses_reported_activity() {
+                return None;
+            }
+            thread
+                .recoverable_submissions()
+                .map(|(submission_id, record)| {
+                    let (status, settled): (SharedString, bool) = match &record.state {
+                        SubmissionState::Pending => ("Sending message…".into(), false),
+                        SubmissionState::Accepted { echoed: false, .. } => {
+                            ("Waiting for message to appear…".into(), false)
+                        }
+                        SubmissionState::Failed(error) => (
+                            format!(
+                                "Message failed to send: {}",
+                                util::truncate_and_trailoff(error, 160)
+                            )
+                            .into(),
+                            true,
+                        ),
+                        SubmissionState::Cancelled => ("Message cancelled".into(), true),
+                        _ => ("Message".into(), false),
+                    };
+                    (
+                        submission_id,
+                        status,
+                        settled,
+                        Itertools::intersperse(Self::submission_text_parts(&record.content), "\n")
+                            .flat_map(str::chars)
+                            .take(161)
+                            .collect::<String>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        if submissions.is_empty() {
+            return None;
+        }
+        let rows = submissions
+            .into_iter()
+            .map(|(submission_id, status, settled, text)| {
+                let preview: SharedString = util::truncate_and_trailoff(&text, 160).into();
+                let row_id = submission_id.as_u64();
+                v_flex()
+                    .id(("recoverable-submission", row_id))
+                    .px_3()
+                    .py_1()
+                    .gap_1()
+                    .child(Label::new(status).size(LabelSize::Small))
+                    .child(Label::new(preview).size(LabelSize::Small))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("copy-submission-{row_id}"))
+                                    .child(
+                                        Button::new(("copy-submission", row_id), "Copy")
+                                            .label_size(LabelSize::Small)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if let Some(record) =
+                                                    this.thread.read(cx).submission(submission_id)
+                                                {
+                                                    let text = Self::submission_text_parts(
+                                                        &record.content,
+                                                    )
+                                                    .join("\n");
+                                                    cx.write_to_clipboard(
+                                                        ClipboardItem::new_string(text),
+                                                    );
+                                                }
+                                            })),
+                                    ),
+                            )
+                            .when(settled, |this| {
+                                this.child(
+                                    div()
+                                        .debug_selector(move || {
+                                            format!("restore-submission-{row_id}")
+                                        })
+                                        .child(
+                                            Button::new(("restore-submission", row_id), "Restore")
+                                                .label_size(LabelSize::Small)
+                                                .tooltip(Tooltip::text("Copy into an empty composer. The saved submission is kept until discarded."))
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.restore_submission(
+                                                            submission_id,
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    Button::new(("discard-submission", row_id), "Discard")
+                                        .label_size(LabelSize::Small)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.thread.update(cx, |thread, cx| {
+                                                thread.forget_submission(submission_id, cx);
+                                            });
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
+                    )
             })
-            .ok();
+            .collect::<Vec<_>>();
+        Some(
+            v_flex()
+                .id("recoverable-submissions")
+                .max_h(px(180.))
+                .overflow_y_scroll()
+                .children(rows),
+        )
     }
 
     pub fn update_turn_tokens(&mut self, cx: &App) {
         if let Some(usage) = self.thread.read(cx).token_usage() {
             if let Some(tokens) = &mut self.turn_fields.turn_tokens {
                 *tokens += usage.output_tokens;
+                self.emit_token_limit_telemetry_if_needed(cx);
             }
         }
+    }
+
+    fn emit_token_limit_telemetry_if_needed(&mut self, cx: &App) {
+        let (ratio, agent_telemetry_id, session_id) = {
+            let thread_data = self.thread.read(cx);
+            let Some(token_usage) = thread_data.token_usage() else {
+                return;
+            };
+            (
+                token_usage.ratio(),
+                thread_data.connection().telemetry_id(),
+                thread_data.session_id().clone(),
+            )
+        };
+
+        let kind = match ratio {
+            acp_thread::TokenUsageRatio::Normal => {
+                self.last_token_limit_telemetry = None;
+                return;
+            }
+            acp_thread::TokenUsageRatio::Warning => "warning",
+            acp_thread::TokenUsageRatio::Exceeded => "exceeded",
+        };
+
+        let should_skip = self
+            .last_token_limit_telemetry
+            .as_ref()
+            .is_some_and(|last| *last >= ratio);
+        if should_skip {
+            return;
+        }
+
+        self.last_token_limit_telemetry = Some(ratio);
+
+        telemetry::event!(
+            "Agent Token Limit Warning",
+            agent = agent_telemetry_id,
+            session_id = session_id,
+            kind = kind,
+        );
     }
 
     // sending
@@ -856,6 +1774,15 @@ impl ThreadView {
     }
 
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.message_editor.read(cx).editor().read(cx).read_only(cx) {
+            self.handle_thread_error(
+                anyhow!(
+                    "This draft contains unsupported content and cannot be edited or sent. Discard the draft to write a new message."
+                ),
+                cx,
+            );
+            return;
+        }
         let thread = &self.thread;
 
         if self.is_loading_contents {
@@ -864,60 +1791,24 @@ impl ThreadView {
 
         let message_editor = self.message_editor.clone();
 
-        // Intercept the first send so the agent panel can capture the full
-        // content blocks — needed for "Start thread in New Worktree",
-        // which must create a workspace before sending the message there.
-        let intercept_first_send = self.thread.read(cx).entries().is_empty()
-            && !message_editor.read(cx).is_empty(cx)
-            && self
-                .workspace
-                .upgrade()
-                .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
-                .is_some_and(|panel| {
-                    panel.read(cx).start_thread_in() == &StartThreadIn::NewWorktree
-                });
-
-        if intercept_first_send {
-            let content_task = self.resolve_message_contents(&message_editor, cx);
-
-            cx.spawn(async move |this, cx| match content_task.await {
-                Ok((content, _tracked_buffers)) => {
-                    if content.is_empty() {
-                        return;
-                    }
-
-                    this.update(cx, |_, cx| {
-                        cx.emit(AcpThreadViewEvent::FirstSendRequested { content });
-                    })
-                    .ok();
-                }
-                Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.handle_thread_error(error, cx);
-                    })
-                    .ok();
-                }
-            })
-            .detach();
-
-            return;
-        }
-
         let is_editor_empty = message_editor.read(cx).is_empty(cx);
         let is_generating = thread.read(cx).status() != ThreadStatus::Idle;
 
-        let has_queued = self.has_queued_messages();
-        if is_editor_empty && self.can_fast_track_queue && has_queued {
-            self.can_fast_track_queue = false;
-            self.send_queued_message_at_index(0, true, window, cx);
-            return;
-        }
-
         if is_editor_empty {
+            if self.message_queue.can_fast_track()
+                && let Some(id) = self.message_queue.first_id()
+                && !self.validate_queued_entry(id, cx)
+            {
+                return;
+            }
+            if let Some(entry) = self.message_queue.try_fast_track(is_generating) {
+                self.dispatch_queued_entry(entry, window, cx);
+            }
             return;
         }
 
         if is_generating {
+            cx.emit(AcpThreadViewEvent::Interacted);
             self.queue_message(message_editor, window, cx);
             return;
         }
@@ -926,7 +1817,10 @@ impl ThreadView {
         let text = text.trim();
         if text == "/login" || text == "/logout" {
             let connection = thread.read(cx).connection().clone();
-            let can_login = !connection.auth_methods().is_empty();
+            let can_login = connection
+                .auth_methods()
+                .iter()
+                .any(acp_thread::auth_methods::is_supported);
             // Does the agent have a specific logout command? Prefer that in case they need to reset internal state.
             let logout_supported = text == "/logout"
                 && self
@@ -934,20 +1828,18 @@ impl ThreadView {
                     .read()
                     .available_commands()
                     .iter()
-                    .any(|command| command.name == "logout");
+                    .any(|available_command| available_command.name == "logout");
             if can_login && !logout_supported {
                 message_editor.update(cx, |editor, cx| editor.clear(window, cx));
                 self.clear_external_source_prompt_warning(cx);
 
                 let connection = self.thread.read(cx).connection().clone();
                 window.defer(cx, {
-                    let agent_id = self.agent_id.clone();
                     let server_view = self.server_view.clone();
                     move |window, cx| {
                         ConversationView::handle_auth_required(
                             server_view.clone(),
                             AuthRequired::new(),
-                            agent_id,
                             connection,
                             window,
                             cx,
@@ -959,7 +1851,80 @@ impl ThreadView {
             }
         }
 
+        // A built-in command (e.g. `/compact`): run the bare command without
+        // echoing it as a user message, and queue any trailing text the user
+        // typed so it isn't silently dropped.
+        let native_command =
+            leading_native_command(text, self.session_capabilities.read().available_commands());
+        if let Some(command_name) = native_command {
+            cx.emit(AcpThreadViewEvent::Interacted);
+            self.send_command_queueing_remainder(message_editor, command_name, window, cx);
+            return;
+        }
+
+        cx.emit(AcpThreadViewEvent::Interacted);
         self.send_impl(message_editor, window, cx)
+    }
+
+    /// Sends a bare `/command` turn and queues everything the user typed after
+    /// it as a follow-up message. The queued remainder auto-processes when the
+    /// command turn stops, so e.g. `/compact do X` compacts and then runs `do X`
+    /// rather than discarding it.
+    fn send_command_queueing_remainder(
+        &mut self,
+        message_editor: Entity<MessageEditor>,
+        command_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Resolve the editor contents before clearing it: the resolve task
+        // reads the editor lazily, so clearing first would wipe the contents.
+        let contents = self.resolve_message_contents(&message_editor, cx);
+        self.thread_error.take();
+        self.thread_feedback.clear();
+        self.editing_message.take();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let (mut content, tracked_buffers) = contents.await?;
+
+            cx.update(|window, cx| {
+                message_editor.update(cx, |message_editor, cx| {
+                    message_editor.clear(window, cx);
+                });
+            })?;
+
+            // Strip the leading `/command` from the first text block; whatever
+            // remains (including any later mention blocks) becomes the queued
+            // follow-up message.
+            if let Some(acp_v2::ContentBlock::Text(text_content)) = content.first_mut() {
+                text_content.text = strip_leading_command(&text_content.text, &command_name);
+            }
+            if matches!(
+                content.first(),
+                Some(acp_v2::ContentBlock::Text(text)) if text.text.trim().is_empty()
+            ) {
+                content.remove(0);
+            }
+
+            let command_block =
+                acp_v2::ContentBlock::Text(acp_v2::TextContent::new(format!("/{command_name}")));
+
+            this.update_in(cx, |this, window, cx| {
+                // Queue the remainder first, then start the command turn; the
+                // queue auto-processes when the command turn stops.
+                if !content.is_empty() {
+                    this.add_to_queue(content, tracked_buffers, window, cx);
+                }
+                this.send_content(
+                    Task::ready(Ok(Some((vec![command_block], Vec::new())))),
+                    true,
+                    window,
+                    cx,
+                );
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     pub fn send_impl(
@@ -973,6 +1938,9 @@ impl ThreadView {
         self.thread_error.take();
         self.thread_feedback.clear();
         self.editing_message.take();
+        // Sending a message is active engagement: un-freeze the queue if it
+        // was paused by a manual stop.
+        self.message_queue.resume();
 
         if self.should_be_following {
             self.workspace
@@ -998,12 +1966,15 @@ impl ThreadView {
             Ok(Some((contents, tracked_buffers)))
         });
 
-        self.send_content(contents_task, window, cx);
+        self.send_content(contents_task, false, window, cx);
     }
 
     pub fn send_content(
         &mut self,
-        contents_task: Task<anyhow::Result<Option<(Vec<acp::ContentBlock>, Vec<Entity<Buffer>>)>>>,
+        contents_task: Task<
+            anyhow::Result<Option<(Vec<acp_v2::ContentBlock>, Vec<Entity<Buffer>>)>>,
+        >,
+        is_native_command: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1024,40 +1995,49 @@ impl ThreadView {
         })
         .detach();
 
+        let side = crate::agent_sidebar_side(cx);
+
         let task = cx.spawn_in(window, async move |this, cx| {
             let Some((contents, tracked_buffers)) = contents_task.await? else {
                 return Ok(());
             };
 
+            let uses_reported_activity =
+                thread.read_with(cx, |thread, _| thread.uses_reported_activity())?;
             let generation = this.update(cx, |this, cx| {
                 this.clear_external_source_prompt_warning(cx);
-                let generation = this.start_turn(cx);
-                this.in_flight_prompt = Some(contents.clone());
-                generation
+                this.thread_error.take();
+                (!uses_reported_activity).then(|| this.start_turn(cx))
             })?;
 
             this.update_in(cx, |this, _window, cx| {
                 this.set_editor_is_expanded(false, cx);
             })?;
-            let _ = this.update(cx, |this, cx| this.scroll_to_bottom(cx));
 
-            let _stop_turn = defer({
+            let _ = this.update(cx, |this, cx| {
+                this.list_state.scroll_to_end();
+                cx.notify();
+            });
+
+            let _stop_turn = (!uses_reported_activity).then(|| {
                 let this = this.clone();
                 let mut cx = cx.clone();
-                move || {
+                defer(move || {
                     this.update(&mut cx, |this, cx| {
-                        this.stop_turn(generation, cx);
+                        if let Some(generation) = generation {
+                            this.stop_turn(generation, cx);
+                        }
                         cx.notify();
                     })
                     .ok();
-                }
+                })
             });
-            if is_first_message {
+            if is_first_message && thread.read_with(cx, |thread, _cx| thread.title().is_none())? {
                 let text: String = contents
                     .iter()
                     .filter_map(|block| match block {
-                        acp::ContentBlock::Text(text_content) => Some(text_content.text.clone()),
-                        acp::ContentBlock::ResourceLink(resource_link) => {
+                        acp_v2::ContentBlock::Text(text_content) => Some(text_content.text.clone()),
+                        acp_v2::ContentBlock::ResourceLink(resource_link) => {
                             Some(format!("@{}", resource_link.name))
                         }
                         _ => None,
@@ -1088,31 +2068,68 @@ impl ThreadView {
                     session = session_id,
                     parent_session_id = parent_session_id.as_ref().map(|id| id.to_string()),
                     model = model_id,
-                    mode = mode_id
+                    mode = mode_id,
+                    side = side
                 );
 
-                thread.send(contents, cx)
+                if is_native_command {
+                    thread.send_command(contents, cx)
+                } else {
+                    thread.send(contents, cx)
+                }
             })?;
+            let submission_id = send.id;
+
+            let _ = this.update(cx, |this, cx| {
+                this.current_submission = Some(submission_id);
+                this.sync_generating_indicator(cx);
+                cx.notify();
+            });
+
             let res = send.await;
             let turn_time_ms = turn_start_time.elapsed().as_millis();
             drop(_stop_turn);
-            let status = if res.is_ok() {
-                let _ = this.update(cx, |this, _| this.in_flight_prompt.take());
-                "success"
-            } else {
-                "failure"
-            };
-            telemetry::event!(
-                "Agent Turn Completed",
-                agent = agent_telemetry_id,
-                session = session_id,
-                parent_session_id = parent_session_id.as_ref().map(|id| id.to_string()),
-                model = model_id,
-                mode = mode_id,
-                status,
-                turn_time_ms,
-            );
-            res.map(|_| ())
+            if !uses_reported_activity {
+                let status = if res.is_ok() { "success" } else { "failure" };
+                telemetry::event!(
+                    "Agent Turn Completed",
+                    agent = agent_telemetry_id,
+                    session = session_id,
+                    parent_session_id = parent_session_id.as_ref().map(|id| id.to_string()),
+                    model = model_id,
+                    mode = mode_id,
+                    status,
+                    turn_time_ms,
+                    side = side
+                );
+            }
+            this.update(cx, |this, cx| {
+                // Cancellation can return control to the UI before this response settles.
+                if this.current_submission != Some(submission_id)
+                    || generation
+                        .is_some_and(|generation| this.turn_fields.turn_generation != generation)
+                {
+                    if let Err(error) = res {
+                        log::debug!("Ignoring error from a superseded agent send: {error:#}");
+                    }
+                    return;
+                }
+                match res {
+                    Ok(Some(SubmissionResponse::LegacyCompleted(_))) => {
+                        this.current_submission.take();
+                        this.should_be_following = this
+                            .workspace
+                            .update(cx, |workspace, _| {
+                                workspace.is_being_followed(CollaboratorId::Agent)
+                            })
+                            .unwrap_or_default();
+                    }
+                    Ok(Some(SubmissionResponse::Accepted(_))) => {}
+                    Ok(None) => {}
+                    Err(error) => this.handle_thread_error(error, cx),
+                }
+            })?;
+            anyhow::Ok(())
         });
 
         cx.spawn(async move |this, cx| {
@@ -1121,28 +2138,28 @@ impl ThreadView {
                     this.handle_thread_error(err, cx);
                 })
                 .ok();
-            } else {
-                this.update(cx, |this, cx| {
-                    let should_be_following = this
-                        .workspace
-                        .update(cx, |workspace, _| {
-                            workspace.is_being_followed(CollaboratorId::Agent)
-                        })
-                        .unwrap_or_default();
-                    this.should_be_following = should_be_following;
-                })
-                .ok();
             }
         })
         .detach();
     }
 
     pub fn interrupt_and_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.message_editor.read(cx).editor().read(cx).read_only(cx) {
+            self.handle_thread_error(
+                anyhow!(
+                    "This draft contains unsupported content and cannot be edited or sent. Discard the draft to write a new message."
+                ),
+                cx,
+            );
+            return;
+        }
         let thread = &self.thread;
 
         if self.is_loading_contents {
             return;
         }
+
+        cx.emit(AcpThreadViewEvent::Interacted);
 
         let message_editor = self.message_editor.clone();
         if thread.read(cx).status() == ThreadStatus::Idle {
@@ -1160,8 +2177,7 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         let thread = self.thread.clone();
-        self.skip_queue_processing_count = 0;
-        self.user_interrupted_generation = true;
+        self.message_queue.pause();
 
         let cancelled = thread.update(cx, |thread, cx| thread.cancel(cx));
 
@@ -1190,7 +2206,7 @@ impl ThreadView {
     fn emit_thread_error_telemetry(&self, error: &ThreadError, cx: &mut Context<Self>) {
         let (error_kind, acp_error_code, message): (&str, Option<SharedString>, SharedString) =
             match error {
-                ThreadError::PaymentRequired => (
+                ThreadError::ZedPaymentRequired => (
                     "payment_required",
                     None,
                     "You reached your free usage limit. Upgrade to Zed Pro for more prompts."
@@ -1204,9 +2220,72 @@ impl ThreadView {
                     );
                     ("refusal", None, message.into())
                 }
+                ThreadError::DataRetentionConsentRequired => {
+                    let message = format!(
+                        "{} is not available with Zero Data Retention.",
+                        self.current_model_name(cx)
+                    );
+                    ("data_retention_consent_required", None, message.into())
+                }
                 ThreadError::AuthenticationRequired(message) => {
                     ("authentication_required", None, message.clone())
                 }
+                ThreadError::RateLimitExceeded { provider } => (
+                    "rate_limit_exceeded",
+                    None,
+                    format!("{provider}'s rate limit was reached.").into(),
+                ),
+                ThreadError::ServerOverloaded { provider } => (
+                    "server_overloaded",
+                    None,
+                    format!("{provider}'s servers are temporarily unavailable.").into(),
+                ),
+                ThreadError::PromptTooLarge => (
+                    "prompt_too_large",
+                    None,
+                    "Context too large for the model's context window.".into(),
+                ),
+                ThreadError::NoCredentials { provider } => (
+                    "no_api_key",
+                    None,
+                    format!("No credentials configured for {provider}.").into(),
+                ),
+                ThreadError::StreamError { provider } => (
+                    "stream_error",
+                    None,
+                    format!("Connection to {provider}'s API was interrupted.").into(),
+                ),
+                ThreadError::AuthenticationFailed { provider } => (
+                    "invalid_api_key",
+                    None,
+                    format!("Authentication with {provider} failed.").into(),
+                ),
+                ThreadError::PermissionDenied { provider, message } => (
+                    "permission_denied",
+                    None,
+                    message.clone().unwrap_or_else(|| {
+                        format!(
+                            "{provider}'s API rejected the request due to insufficient permissions."
+                        )
+                        .into()
+                    }),
+                ),
+                ThreadError::ProviderRejection { message } => {
+                    ("provider_rejection", None, message.clone())
+                }
+                ThreadError::MaxOutputTokens => (
+                    "max_output_tokens",
+                    None,
+                    "Model reached its maximum output length.".into(),
+                ),
+                ThreadError::NoModelSelected => {
+                    ("no_model_selected", None, "No model selected.".into())
+                }
+                ThreadError::ApiError { provider } => (
+                    "api_error",
+                    None,
+                    format!("{provider}'s API returned an unexpected error.").into(),
+                ),
                 ThreadError::Other {
                     acp_error_code,
                     message,
@@ -1232,13 +2311,13 @@ impl ThreadView {
         );
     }
 
-    // generation
-
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
         self.thread_retry_status.take();
         self.thread_error.take();
-        self.user_interrupted_generation = true;
+        self.message_queue.pause();
         self._cancel_task = Some(self.thread.update(cx, |thread, cx| thread.cancel(cx)));
+        self.sync_generating_indicator(cx);
+        cx.notify();
     }
 
     pub fn retry_generation(&mut self, cx: &mut Context<Self>) {
@@ -1250,12 +2329,24 @@ impl ThreadView {
         }
 
         let task = thread.update(cx, |thread, cx| thread.retry(cx));
+        let submission_id = task.id;
+        self.current_submission = Some(submission_id);
+        cx.emit(AcpThreadViewEvent::Interacted);
+        self.sync_generating_indicator(cx);
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = task.await;
 
             this.update(cx, |this, cx| {
-                if let Err(err) = result {
-                    this.handle_thread_error(err, cx);
+                if this.current_submission != Some(submission_id) {
+                    return;
+                }
+                match result {
+                    Err(error) => this.handle_thread_error(error, cx),
+                    Ok(Some(SubmissionResponse::LegacyCompleted(_))) => {
+                        this.current_submission = None;
+                    }
+                    Ok(Some(SubmissionResponse::Accepted(_)) | None) => {}
                 }
             })
         })
@@ -1269,13 +2360,18 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.is_loading_contents {
+        if self.is_loading_contents || !self.can_edit_user_message(entry_ix, cx) {
             return;
         }
         let thread = self.thread.clone();
 
-        let Some(user_message_id) = thread.update(cx, |thread, _| {
-            thread.entries().get(entry_ix)?.user_message()?.id.clone()
+        let Some(client_id) = thread.update(cx, |thread, _| {
+            thread
+                .entries()
+                .get(entry_ix)?
+                .user_message()?
+                .client_id
+                .clone()
         }) else {
             return;
         };
@@ -1287,12 +2383,19 @@ impl ThreadView {
             //
             // If editing the prompt that generated the edits, they are auto-rejected
             // through the `rewind` function in the `acp_thread`.
+            //
+            // Subagent edits never show up as diffs in the parent thread's entries (they
+            // are only forwarded to the parent's action log), so treat any earlier
+            // subagent tool call as potentially having edits. Keeping all edits is a
+            // no-op when the subagent didn't make any.
             let has_earlier_edits = thread.read_with(cx, |thread, _| {
-                thread
-                    .entries()
-                    .iter()
-                    .take(entry_ix)
-                    .any(|entry| entry.diffs().next().is_some())
+                thread.entries().iter().take(entry_ix).any(|entry| {
+                    entry.diffs().next().is_some()
+                        || matches!(
+                            entry,
+                            AgentThreadEntry::ToolCall(tool_call) if tool_call.is_subagent()
+                        )
+                })
             });
 
             if has_earlier_edits {
@@ -1304,11 +2407,22 @@ impl ThreadView {
             }
 
             thread
-                .update(cx, |thread, cx| thread.rewind(user_message_id, cx))
+                .update(cx, |thread, cx| thread.rewind(client_id, cx))
                 .await?;
             this.update_in(cx, |thread, window, cx| {
+                // Rewind can outlive a source update that replaces the editor with a fallback.
+                if message_editor.read(cx).editor().read(cx).read_only(cx) {
+                    thread.handle_thread_error(
+                        anyhow!(
+                            "The conversation was rewound, but the message became read-only and was not resent."
+                        ),
+                        cx,
+                    );
+                    return;
+                }
+                cx.emit(AcpThreadViewEvent::Interacted);
                 thread.send_impl(message_editor, window, cx);
-                thread.focus_handle(cx).focus(window, cx);
+                thread.activation_focus_handle(cx).focus(window, cx);
             })?;
             anyhow::Ok(())
         })
@@ -1340,8 +2454,7 @@ impl ThreadView {
             }
 
             this.update_in(cx, |this, window, cx| {
-                this.add_to_queue(content, tracked_buffers, cx);
-                this.can_fast_track_queue = true;
+                this.add_to_queue(content, tracked_buffers, window, cx);
                 message_editor.update(cx, |message_editor, cx| {
                     message_editor.clear(window, cx);
                 });
@@ -1354,62 +2467,241 @@ impl ThreadView {
 
     pub fn add_to_queue(
         &mut self,
-        content: Vec<acp::ContentBlock>,
+        content: Vec<acp_v2::ContentBlock>,
         tracked_buffers: Vec<Entity<Buffer>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.local_queued_messages.push(QueuedMessage {
+        // The ID must be allocated up front so the editor event subscription
+        // can capture it before the entry (which owns the subscription) exists.
+        let id = self.message_queue.next_id();
+
+        let editor = cx.new(|cx| {
+            let mut editor = MessageEditor::new(
+                self.workspace.clone(),
+                self.project.clone(),
+                None,
+                self.session_capabilities.clone(),
+                self.agent_id.clone(),
+                "",
+                EditorMode::AutoHeight {
+                    min_lines: 1,
+                    max_lines: Some(10),
+                },
+                window,
+                cx,
+            );
+            editor.set_read_only(true, cx);
+            editor.set_source_message(content.clone(), window, cx);
+            editor
+        });
+
+        let subscription =
+            cx.subscribe_in(&editor, window, move |this, _editor, event, window, cx| {
+                this.handle_queue_editor_event(id, event, window, cx);
+            });
+
+        self.message_queue.enqueue(QueueEntry {
+            id,
             content,
             tracked_buffers,
+            steer: false,
+            editor,
+            _subscription: subscription,
         });
         self.sync_queue_flag_to_native_thread(cx);
+        cx.notify();
+    }
+
+    fn handle_queue_editor_event(
+        &mut self,
+        id: QueueEntryId,
+        event: &MessageEditorEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            MessageEditorEvent::InputAttempted {
+                attempt,
+                cursor_offset,
+            } => {
+                self.move_queued_message_to_main_editor(
+                    id,
+                    Some(attempt.clone()),
+                    Some(*cursor_offset),
+                    window,
+                    cx,
+                );
+            }
+            MessageEditorEvent::LostFocus => {
+                self.save_queued_message(id, cx);
+            }
+            MessageEditorEvent::Cancel | MessageEditorEvent::Send => {
+                window.focus(&self.message_editor.focus_handle(cx), cx);
+            }
+            MessageEditorEvent::SendImmediately => {
+                self.send_queued_message_now(id, window, cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn save_queued_message(&mut self, id: QueueEntryId, cx: &mut Context<Self>) {
+        let Some(entry) = self.message_queue.entry_by_id(id) else {
+            return;
+        };
+        if !entry
+            .content
+            .iter()
+            .all(acp_thread::content::can_convert_to_v1)
+        {
+            return;
+        }
+        let contents_task = entry
+            .editor
+            .update(cx, |editor, cx| editor.contents(false, cx));
+
+        cx.spawn(async move |this, cx| {
+            let (content, tracked_buffers) = contents_task.await?;
+
+            this.update(cx, |this, cx| {
+                if let Some(entry) = this.message_queue.entry_by_id_mut(id) {
+                    if !entry
+                        .content
+                        .iter()
+                        .all(acp_thread::content::can_convert_to_v1)
+                    {
+                        return;
+                    }
+                    entry.content = content;
+                    entry.tracked_buffers = tracked_buffers;
+                }
+                cx.notify();
+            })?;
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .detach_and_log_err(cx);
     }
 
     pub fn remove_from_queue(
         &mut self,
-        index: usize,
+        id: QueueEntryId,
         cx: &mut Context<Self>,
-    ) -> Option<QueuedMessage> {
-        if index < self.local_queued_messages.len() {
-            let removed = self.local_queued_messages.remove(index);
+    ) -> Option<QueueEntry> {
+        let removed = self.message_queue.remove(id);
+        if removed.is_some() {
             self.sync_queue_flag_to_native_thread(cx);
-            Some(removed)
-        } else {
-            None
         }
+        removed
+    }
+
+    fn toggle_queue_entry_steer(&mut self, id: QueueEntryId, cx: &mut Context<Self>) {
+        self.message_queue.toggle_steer(id);
+        self.sync_queue_flag_to_native_thread(cx);
+        cx.notify();
     }
 
     pub fn sync_queue_flag_to_native_thread(&self, cx: &mut Context<Self>) {
         if let Some(native_thread) = self.as_native_thread(cx) {
-            let has_queued = self.has_queued_messages();
+            // By default queued messages wait for the turn to fully complete.
+            // Only a "steering" front message ends the turn at the next boundary.
+            let end_at_boundary = self.message_queue.front_wants_steer()
+                && self.message_queue.first().is_some_and(|entry| {
+                    self.thread
+                        .read(cx)
+                        .validate_prompt_content(&entry.content)
+                        .is_ok()
+                });
             native_thread.update(cx, |thread, _| {
-                thread.set_has_queued_message(has_queued);
+                thread.set_end_turn_at_next_boundary(end_at_boundary);
             });
         }
     }
 
-    pub fn send_queued_message_at_index(
+    fn validate_queued_entry(&mut self, id: QueueEntryId, cx: &mut Context<Self>) -> bool {
+        let Some(entry) = self.message_queue.entry_by_id(id) else {
+            return false;
+        };
+        if let Err(error) = self.thread.read(cx).validate_prompt_content(&entry.content) {
+            self.handle_thread_error(error, cx);
+            return false;
+        }
+        true
+    }
+
+    pub fn send_queued_message_after_generation_stopped(
         &mut self,
-        index: usize,
-        is_send_now: bool,
+        is_first_editor_focused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if let Some(id) = self
+            .message_queue
+            .auto_send_candidate(is_first_editor_focused)
+            .map(|entry| entry.id)
+            && !self.validate_queued_entry(id, cx)
+        {
+            self.message_queue.pause();
+        }
+        if let Some(entry) = self
+            .message_queue
+            .on_generation_stopped(is_first_editor_focused)
+        {
+            self.dispatch_queued_entry(entry, window, cx);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn send_queued_message_now(
+        &mut self,
+        id: QueueEntryId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(queued) = self.remove_from_queue(index, cx) else {
+        if !self.validate_queued_entry(id, cx) {
             return;
-        };
-        let content = queued.content;
-        let tracked_buffers = queued.tracked_buffers;
-
-        // Only increment skip count for "Send Now" operations (out-of-order sends)
-        // Normal auto-processing from the Stopped handler doesn't need to skip.
-        // We only skip the Stopped event from the cancelled generation, NOT the
-        // Stopped event from the newly sent message (which should trigger queue processing).
-        if is_send_now {
-            let is_generating =
-                self.thread.read(cx).status() == acp_thread::ThreadStatus::Generating;
-            self.skip_queue_processing_count += if is_generating { 1 } else { 0 };
         }
+        let is_generating = self.thread.read(cx).status() == acp_thread::ThreadStatus::Generating;
+        if let Some(entry) = self.message_queue.send_now(id, is_generating) {
+            self.dispatch_queued_entry(entry, window, cx);
+        }
+    }
+
+    /// The shared "actually send this entry" path, used by fast-track,
+    /// auto-processing on Stopped, and "Send Now". The entry must already have
+    /// been removed from the queue.
+    fn dispatch_queued_entry(
+        &mut self,
+        entry: QueueEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_queue_flag_to_native_thread(cx);
+
+        cx.emit(AcpThreadViewEvent::Interacted);
+
+        self.message_editor.focus_handle(cx).focus(window, cx);
+
+        let content = entry.content;
+        let tracked_buffers = entry.tracked_buffers;
+
+        // A queued message can itself be a built-in command (e.g. the user typed
+        // `/compact` while a turn was generating). Detect that so we run it as a
+        // command turn without echoing it as a user message, matching the
+        // non-queued path.
+        let is_native_command = content
+            .first()
+            .and_then(|block| match block {
+                acp_v2::ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .and_then(|text| {
+                leading_native_command(text, self.session_capabilities.read().available_commands())
+            })
+            .is_some();
 
         let cancelled = self.thread.update(cx, |thread, cx| thread.cancel(cx));
 
@@ -1429,45 +2721,92 @@ impl ThreadView {
             Ok(Some((content, tracked_buffers)))
         });
 
-        self.send_content(contents_task, window, cx);
+        self.send_content(contents_task, is_native_command, window, cx);
     }
 
     pub fn move_queued_message_to_main_editor(
         &mut self,
-        index: usize,
-        inserted_text: Option<&str>,
+        id: QueueEntryId,
+        attempt: Option<InputAttempt>,
+        cursor_offset: Option<usize>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(queued_message) = self.remove_from_queue(index, cx) else {
+        if self.message_editor.read(cx).editor().read(cx).read_only(cx) {
+            self.handle_thread_error(
+                anyhow!("Discard the unsupported draft before moving a queued message into the composer."),
+                cx,
+            );
+            return false;
+        }
+        if self.message_queue.entry_by_id(id).is_some_and(|entry| {
+            !entry
+                .content
+                .iter()
+                .all(acp_thread::content::can_convert_to_v1)
+        }) {
+            self.handle_thread_error(
+                anyhow!("This queued message contains unsupported content and cannot be edited."),
+                cx,
+            );
+            return false;
+        }
+        let Some(queued_message) = self.remove_from_queue(id, cx) else {
             return false;
         };
         let queued_content = queued_message.content;
         let message_editor = self.message_editor.clone();
-        let inserted_text = inserted_text.map(ToOwned::to_owned);
 
         window.focus(&message_editor.focus_handle(cx), cx);
 
-        if message_editor.read(cx).is_empty(cx) {
+        let adjusted_cursor_offset = if message_editor.read(cx).is_empty(cx) {
             message_editor.update(cx, |editor, cx| {
                 editor.set_message(queued_content, window, cx);
-                if let Some(inserted_text) = inserted_text.as_deref() {
-                    editor.insert_text(inserted_text, window, cx);
-                }
             });
-            cx.notify();
-            return true;
-        }
+            cursor_offset
+        } else {
+            let existing_len = message_editor.read(cx).text(cx).len();
+            let separator = "\n\n";
+            message_editor.update(cx, |editor, cx| {
+                editor.append_message(queued_content, Some(separator), window, cx);
+            });
+            cursor_offset.map(|offset| existing_len + separator.len() + offset)
+        };
 
         message_editor.update(cx, |editor, cx| {
-            editor.append_message(queued_content, Some("\n\n"), window, cx);
-            if let Some(inserted_text) = inserted_text.as_deref() {
-                editor.insert_text(inserted_text, window, cx);
+            if let Some(offset) = adjusted_cursor_offset {
+                editor.set_cursor_offset(offset, window, cx);
+            }
+            match attempt {
+                Some(InputAttempt::Text(text)) => {
+                    editor.insert_text(&text, window, cx);
+                }
+                Some(InputAttempt::Paste(clipboard)) => {
+                    editor.paste_item(&clipboard, window, cx);
+                }
+                None => {}
             }
         });
 
         cx.notify();
         true
+    }
+
+    fn handle_message_editor_move_up(
+        &mut self,
+        _: &zed_actions::editor::MoveUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.message_editor.read(cx).is_empty(cx) {
+            cx.propagate();
+            return;
+        }
+        let Some(last_id) = self.message_queue.last_id() else {
+            cx.propagate();
+            return;
+        };
+        self.move_queued_message_to_main_editor(last_id, None, None, window, cx);
     }
 
     // editor methods
@@ -1478,6 +2817,9 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.list_state.item_count() == 0 {
+            return;
+        }
         self.set_editor_is_expanded(!self.editor_expanded, cx);
         cx.stop_propagation();
         cx.notify();
@@ -1485,28 +2827,31 @@ impl ThreadView {
 
     pub fn set_editor_is_expanded(&mut self, is_expanded: bool, cx: &mut Context<Self>) {
         self.editor_expanded = is_expanded;
-        self.message_editor.update(cx, |editor, cx| {
-            if is_expanded {
-                editor.set_mode(
-                    EditorMode::Full {
-                        scale_ui_elements_with_buffer_font_size: false,
-                        show_active_line_background: false,
-                        sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
-                    },
-                    cx,
-                )
-            } else {
-                let agent_settings = AgentSettings::get_global(cx);
-                editor.set_mode(
-                    EditorMode::AutoHeight {
-                        min_lines: agent_settings.message_editor_min_lines,
-                        max_lines: Some(agent_settings.set_message_editor_max_lines()),
-                    },
-                    cx,
-                )
-            }
-        });
+        self.sync_editor_mode(cx);
         cx.notify();
+    }
+
+    fn title_editor_version(editor: &Editor, cx: &App) -> Option<(gpui::EntityId, clock::Global)> {
+        editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .map(|buffer| (buffer.entity_id(), buffer.read(cx).version()))
+    }
+
+    pub(super) fn sync_title_editor(
+        &mut self,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.title_editor.read(cx).text(cx) == title {
+            return;
+        }
+        self.title_editor_sync_version = self.title_editor.update(cx, |editor, cx| {
+            editor.set_text(title, window, cx);
+            Self::title_editor_version(editor, cx)
+        });
     }
 
     pub fn handle_title_editor_event(
@@ -1516,33 +2861,55 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let thread = &self.thread;
-
         match event {
             EditorEvent::BufferEdited => {
-                // We only want to set the title if the user has actively edited
-                // it. If the title editor is not focused, we programmatically
-                // changed the text, so we don't want to set the title again.
                 if !title_editor.read(cx).is_focused(window) {
                     return;
                 }
 
+                // BufferEdited has no origin; equal text can still be an explicit user rename.
+                let version = Self::title_editor_version(title_editor.read(cx), cx);
+                if version.is_some() && version == self.title_editor_sync_version {
+                    return;
+                }
                 let new_title = title_editor.read(cx).text(cx);
-                thread.update(cx, |thread, cx| {
-                    thread
-                        .set_title(new_title.into(), cx)
-                        .detach_and_log_err(cx);
-                })
+                if new_title.is_empty() {
+                    return;
+                }
+                self.apply_renamed_title(SharedString::from(new_title), cx);
             }
             EditorEvent::Blurred => {
                 if title_editor.read(cx).text(cx).is_empty() {
-                    title_editor.update(cx, |editor, cx| {
-                        editor.set_text("New Thread", window, cx);
-                    });
+                    self.sync_title_editor(DEFAULT_THREAD_TITLE.into(), window, cx);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Renames the thread, mirroring the editor text and persisting the new
+    /// title. Used by callers outside of the title editor (e.g. the sidebar's
+    /// inline rename) so that they go through the same persistence path as
+    /// the in-thread title editor.
+    pub fn rename(&mut self, title: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_title_editor(title.clone(), window, cx);
+        self.apply_renamed_title(title, cx);
+    }
+
+    fn apply_renamed_title(&mut self, title: SharedString, cx: &mut Context<Self>) {
+        if let Some(store) = ThreadMetadataStore::try_global(cx)
+            && !self.is_subagent()
+        {
+            let thread_id = self.root_thread_id;
+            store.update(cx, |store, cx| {
+                store.set_title_override(thread_id, title.clone(), cx);
+            });
+        }
+        self.thread.update(cx, |thread, cx| {
+            if thread.can_set_title(cx) {
+                thread.set_title(title, cx).detach_and_log_err(cx);
+            }
+        });
     }
 
     pub fn cancel_editing(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1562,26 +2929,28 @@ impl ThreadView {
                     .get(index)
                     .and_then(|e| e.user_message())
                 {
-                    editor.set_message(user_message.chunks.clone(), window, cx);
+                    editor.set_source_message(
+                        user_message.content.source_blocks().to_vec(),
+                        window,
+                        cx,
+                    );
                 }
             })
         };
+        self.message_editor.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
-    // tool permissions
-
-    pub fn authorize_tool_call(
+    pub fn authorize_permission_request(
         &mut self,
-        session_id: acp::SessionId,
-        tool_call_id: acp::ToolCallId,
+        session_id: acp_v2::SessionId,
+        request_id: PermissionRequestId,
         outcome: SelectedPermissionOutcome,
-        option_kind: acp::PermissionOptionKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.conversation.update(cx, |conversation, cx| {
-            conversation.authorize_tool_call(session_id, tool_call_id, outcome, option_kind, cx);
+            conversation.authorize_permission_request(session_id, request_id, outcome, cx);
         });
         if self.should_be_following {
             self.workspace
@@ -1594,11 +2963,38 @@ impl ThreadView {
     }
 
     pub fn allow_always(&mut self, _: &AllowAlways, window: &mut Window, cx: &mut Context<Self>) {
-        self.authorize_pending_tool_call(acp::PermissionOptionKind::AllowAlways, window, cx);
+        if self.pending_allow_blocked_by_confusables(cx) {
+            return;
+        }
+        self.authorize_pending_tool_call(acp_v2::PermissionOptionKind::AllowAlways, window, cx);
     }
 
     pub fn allow_once(&mut self, _: &AllowOnce, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_allow_blocked_by_confusables(cx) {
+            return;
+        }
         self.authorize_pending_with_granularity(true, window, cx);
+    }
+
+    /// Whether the currently pending permission prompt is blocked by an
+    /// unacknowledged surprising-Unicode warning, so the keyboard allow
+    /// shortcuts must be ignored (mirroring the disabled allow buttons).
+    fn pending_allow_blocked_by_confusables(&self, cx: &Context<Self>) -> bool {
+        let session_id = self.thread.read(cx).session_id().clone();
+        let Some((_, tool_call_id, _)) = self
+            .conversation
+            .read(cx)
+            .pending_tool_call(&session_id, cx)
+        else {
+            return false;
+        };
+        self.thread.read(cx).entries().iter().any(|entry| {
+            matches!(
+                entry,
+                AgentThreadEntry::ToolCall(call)
+                    if call.id == tool_call_id && self.sandbox_confusables_block_allow(call, cx)
+            )
+        })
     }
 
     pub fn reject_once(&mut self, _: &RejectOnce, window: &mut Window, cx: &mut Context<Self>) {
@@ -1607,12 +3003,13 @@ impl ThreadView {
 
     pub fn authorize_pending_tool_call(
         &mut self,
-        kind: acp::PermissionOptionKind,
+        kind: acp_v2::PermissionOptionKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<()> {
+        let session_id = self.thread.read(cx).session_id().clone();
         self.conversation.update(cx, |conversation, cx| {
-            conversation.authorize_pending_tool_call(&self.id, kind, cx)
+            conversation.authorize_pending_tool_call(&session_id, kind, cx)
         })?;
         if self.should_be_following {
             self.workspace
@@ -1625,30 +3022,263 @@ impl ThreadView {
         Some(())
     }
 
+    fn has_pending_request_elicitation(&self, cx: &App) -> bool {
+        self.server_view
+            .read_with(cx, |server_view, cx| {
+                server_view
+                    .request_elicitation_store()
+                    .is_some_and(|store| {
+                        store.read(cx).elicitations().iter().any(|elicitation| {
+                            matches!(elicitation.status, ElicitationStatus::Pending { .. })
+                        })
+                    })
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn sync_elicitation_state_for_entry(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let elicitation_id = {
+            let thread = self.thread.read(cx);
+            let Some(AgentThreadEntry::Elicitation(elicitation_id)) = thread.entries().get(index)
+            else {
+                return;
+            };
+            elicitation_id.clone()
+        };
+
+        let thread = self.thread.read(cx);
+        let entry = thread.elicitation(&elicitation_id).map(|(_, elicitation)| {
+            (
+                elicitation_id.clone(),
+                matches!(elicitation.status, ElicitationStatus::Pending { .. }),
+                match &elicitation.request.mode {
+                    acp_v2::ElicitationMode::Form(mode) => Some(mode.requested_schema.clone()),
+                    _ => None,
+                },
+            )
+        });
+
+        let Some((id, is_pending, schema)) = entry else {
+            return;
+        };
+
+        if is_pending
+            && let Some(schema) = schema
+            && !self.elicitation_form_states.contains_key(&id)
+        {
+            self.elicitation_form_states
+                .insert(id, ElicitationFormState::new(&schema, window, cx));
+        } else if !is_pending {
+            self.elicitation_form_states.remove(&id);
+        }
+    }
+
+    fn sync_existing_elicitation_states(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let entry_count = self.thread.read(cx).entries().len();
+        for index in 0..entry_count {
+            self.sync_elicitation_state_for_entry(index, window, cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_elicitation_form_state(&self, id: &ElicitationEntryId) -> bool {
+        self.elicitation_form_states.contains_key(id)
+    }
+
+    fn submit_elicitation(
+        &mut self,
+        elicitation_id: ElicitationEntryId,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mode = self
+            .thread
+            .read(cx)
+            .elicitation(&elicitation_id)
+            .map(|(_, elicitation)| elicitation.request.mode.clone());
+
+        let Some(mode) = mode else {
+            return;
+        };
+
+        match mode {
+            acp_v2::ElicitationMode::Form(mode) => {
+                let Some(state) = self.elicitation_form_states.get_mut(&elicitation_id) else {
+                    return;
+                };
+                let Some(submission) = state.begin_submission(cx) else {
+                    return;
+                };
+                let schema = mode.requested_schema;
+                let validation_task = cx.background_spawn(async move {
+                    let result = submission.validate(&schema);
+                    (submission, result)
+                });
+                cx.notify();
+                cx.spawn(async move |this, cx| {
+                    let (submission, result) = validation_task.await;
+                    this.update(cx, |this, cx| {
+                        let is_current = this
+                            .elicitation_form_states
+                            .get_mut(&elicitation_id)
+                            .is_some_and(|state| {
+                                state.validation_matches_current_values(&submission, cx)
+                            });
+                        if !is_current {
+                            cx.notify();
+                            return;
+                        }
+                        match result {
+                            Ok(content) => {
+                                this.respond_to_elicitation(
+                                    elicitation_id,
+                                    acp_v2::CreateElicitationResponse::new(
+                                        acp_v2::ElicitationAction::Accept(
+                                            acp_v2::ElicitationAcceptAction::new().content(content),
+                                        ),
+                                    ),
+                                    cx,
+                                );
+                            }
+                            Err(errors) => {
+                                if let Some(state) =
+                                    this.elicitation_form_states.get_mut(&elicitation_id)
+                                {
+                                    state.set_errors(errors);
+                                }
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .log_err();
+                })
+                .detach();
+            }
+            acp_v2::ElicitationMode::Url(_) => {
+                self.respond_to_elicitation(
+                    elicitation_id,
+                    acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Accept(
+                        acp_v2::ElicitationAcceptAction::new(),
+                    )),
+                    cx,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn decline_elicitation(
+        &mut self,
+        elicitation_id: ElicitationEntryId,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.respond_to_elicitation(
+            elicitation_id,
+            acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Decline),
+            cx,
+        );
+    }
+
+    fn cancel_elicitation(
+        &mut self,
+        elicitation_id: ElicitationEntryId,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.respond_to_elicitation(
+            elicitation_id,
+            acp_v2::CreateElicitationResponse::new(acp_v2::ElicitationAction::Cancel),
+            cx,
+        );
+    }
+
+    fn dismiss_url_elicitation(
+        &mut self,
+        elicitation_id: ElicitationEntryId,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.elicitation_form_states.remove(&elicitation_id);
+        self.thread.update(cx, |thread, cx| {
+            thread.cancel_elicitation(&elicitation_id, cx);
+        });
+        cx.notify();
+    }
+
+    fn respond_to_elicitation(
+        &mut self,
+        elicitation_id: ElicitationEntryId,
+        response: acp_v2::CreateElicitationResponse,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = self.session_id.clone();
+        self.elicitation_form_states.remove(&elicitation_id);
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.respond_to_elicitation(session_id, elicitation_id, response, cx);
+        });
+        cx.notify();
+    }
+
     fn handle_authorize_tool_call(
         &mut self,
         action: &AuthorizeToolCall,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tool_call_id = acp::ToolCallId::new(action.tool_call_id.clone());
-        let option_id = acp::PermissionOptionId::new(action.option_id.clone());
+        let Some((session_id, request_id)) = self.permission_action_target(
+            action.session_id.as_deref(),
+            action.request_id,
+            &action.tool_call_id,
+            cx,
+        ) else {
+            return;
+        };
+        let option_id = acp_v2::PermissionOptionId::new(action.option_id.clone());
         let option_kind = match action.option_kind.as_str() {
-            "AllowOnce" => acp::PermissionOptionKind::AllowOnce,
-            "AllowAlways" => acp::PermissionOptionKind::AllowAlways,
-            "RejectOnce" => acp::PermissionOptionKind::RejectOnce,
-            "RejectAlways" => acp::PermissionOptionKind::RejectAlways,
-            _ => acp::PermissionOptionKind::AllowOnce,
+            "AllowOnce" => acp_v2::PermissionOptionKind::AllowOnce,
+            "AllowAlways" => acp_v2::PermissionOptionKind::AllowAlways,
+            "RejectOnce" => acp_v2::PermissionOptionKind::RejectOnce,
+            "RejectAlways" => acp_v2::PermissionOptionKind::RejectAlways,
+            _ => return,
         };
 
-        self.authorize_tool_call(
-            self.id.clone(),
-            tool_call_id,
-            option_id.into(),
-            option_kind,
+        self.authorize_permission_request(
+            session_id,
+            request_id,
+            SelectedPermissionOutcome::new(option_id, option_kind),
             window,
             cx,
         );
+    }
+
+    fn permission_action_target(
+        &self,
+        session_id: Option<&str>,
+        request_id: Option<PermissionRequestId>,
+        tool_call_id: &str,
+        cx: &App,
+    ) -> Option<(acp_v2::SessionId, PermissionRequestId)> {
+        let session_id = session_id
+            .map(acp_v2::SessionId::new)
+            .unwrap_or_else(|| self.thread.read(cx).session_id().clone());
+        let conversation = self.conversation.read(cx);
+        let request = if let Some(id) = request_id {
+            conversation.permission_request(&session_id, id, cx)?
+        } else {
+            conversation
+                .threads
+                .get(&session_id)?
+                .read(cx)
+                .permission_request_for_tool(&acp_v2::ToolCallId::new(tool_call_id))?
+        };
+        request.legacy_options()?;
+        Some((session_id, request.id))
     }
 
     pub fn handle_select_permission_granularity(
@@ -1657,11 +3287,17 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tool_call_id = acp::ToolCallId::new(action.tool_call_id.clone());
-        self.permission_selections
-            .insert(tool_call_id, PermissionSelection::Choice(action.index));
-
-        cx.notify();
+        let Some((session_id, request_id)) = self.permission_action_target(
+            action.session_id.as_deref(),
+            action.request_id,
+            &action.tool_call_id,
+            cx,
+        ) else {
+            return;
+        };
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.set_permission_choice(&session_id, request_id, action.index, cx);
+        });
     }
 
     pub fn handle_toggle_command_pattern(
@@ -1670,49 +3306,22 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tool_call_id = acp::ToolCallId::new(action.tool_call_id.clone());
-
-        match self.permission_selections.get_mut(&tool_call_id) {
-            Some(PermissionSelection::SelectedPatterns(checked)) => {
-                // Already in pattern mode — toggle the individual pattern.
-                if let Some(pos) = checked.iter().position(|&i| i == action.pattern_index) {
-                    checked.swap_remove(pos);
-                } else {
-                    checked.push(action.pattern_index);
-                }
-            }
-            _ => {
-                // First click: activate "Select options" with all patterns checked.
-                let thread = self.thread.read(cx);
-                let pattern_count = thread
-                    .entries()
-                    .iter()
-                    .find_map(|entry| {
-                        if let AgentThreadEntry::ToolCall(call) = entry {
-                            if call.id == tool_call_id {
-                                if let ToolCallStatus::WaitingForConfirmation { options, .. } =
-                                    &call.status
-                                {
-                                    if let PermissionOptions::DropdownWithPatterns {
-                                        patterns,
-                                        ..
-                                    } = options
-                                    {
-                                        return Some(patterns.len());
-                                    }
-                                }
-                            }
-                        }
-                        None
-                    })
-                    .unwrap_or(0);
-                self.permission_selections.insert(
-                    tool_call_id,
-                    PermissionSelection::SelectedPatterns((0..pattern_count).collect()),
-                );
-            }
-        }
-        cx.notify();
+        let Some((session_id, request_id)) = self.permission_action_target(
+            action.session_id.as_deref(),
+            action.request_id,
+            &action.tool_call_id,
+            cx,
+        ) else {
+            return;
+        };
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.toggle_permission_pattern(
+                &session_id,
+                request_id,
+                action.pattern_index,
+                cx,
+            );
+        });
     }
 
     fn authorize_pending_with_granularity(
@@ -1721,109 +3330,33 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<()> {
-        let (session_id, tool_call_id, options) =
-            self.conversation.read(cx).pending_tool_call(&self.id, cx)?;
-        let options = options.clone();
-        self.authorize_with_granularity(session_id, tool_call_id, &options, is_allow, window, cx)
+        let session_id = self.thread.read(cx).session_id().clone();
+        let (returned_session_id, request) = self
+            .conversation
+            .read(cx)
+            .pending_permission_request(&session_id, cx)?;
+        self.authorize_with_granularity(returned_session_id, request.id, is_allow, window, cx)
     }
 
     fn authorize_with_granularity(
         &mut self,
-        session_id: acp::SessionId,
-        tool_call_id: acp::ToolCallId,
-        options: &PermissionOptions,
+        session_id: acp_v2::SessionId,
+        request_id: PermissionRequestId,
         is_allow: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<()> {
-        let (choices, dropdown_with_patterns) = match options {
-            PermissionOptions::Dropdown(choices) => (choices.as_slice(), None),
-            PermissionOptions::DropdownWithPatterns {
-                choices,
-                patterns,
-                tool_name,
-            } => (
-                choices.as_slice(),
-                Some((patterns.as_slice(), tool_name.as_str())),
-            ),
-            _ => {
-                let kind = if is_allow {
-                    acp::PermissionOptionKind::AllowOnce
-                } else {
-                    acp::PermissionOptionKind::RejectOnce
-                };
-                return self.authorize_pending_tool_call(kind, window, cx);
-            }
-        };
-
-        let selection = self.permission_selections.get(&tool_call_id);
-
-        // When in per-command pattern mode, use the checked patterns.
-        if let Some(PermissionSelection::SelectedPatterns(checked)) = selection
-            && let Some((patterns, tool_name)) = dropdown_with_patterns
-        {
-            let checked_patterns: Vec<_> = patterns
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| checked.contains(index))
-                .map(|(_, cp)| cp.pattern.clone())
-                .collect();
-
-            if !checked_patterns.is_empty() {
-                let (option_id_str, kind) = if is_allow {
-                    (
-                        format!("always_allow:{}", tool_name),
-                        acp::PermissionOptionKind::AllowAlways,
-                    )
-                } else {
-                    (
-                        format!("always_deny:{}", tool_name),
-                        acp::PermissionOptionKind::RejectAlways,
-                    )
-                };
-                let outcome =
-                    SelectedPermissionOutcome::new(acp::PermissionOptionId::new(option_id_str))
-                        .params(Some(SelectedPermissionParams::Terminal {
-                            patterns: checked_patterns,
-                        }));
-                self.authorize_tool_call(session_id, tool_call_id, outcome, kind, window, cx);
-                return Some(());
-            }
+        self.conversation.update(cx, |conversation, cx| {
+            conversation.authorize_with_granularity(session_id, request_id, is_allow, cx)
+        })?;
+        if self.should_be_following {
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    workspace.follow(CollaboratorId::Agent, window, cx);
+                })
+                .ok();
         }
-
-        // Use the selected granularity choice ("Always for terminal" or "Only this time")
-        let selected_index = selection
-            .and_then(|s| s.choice_index())
-            .unwrap_or_else(|| choices.len().saturating_sub(1));
-
-        let selected_choice = choices.get(selected_index).or(choices.last())?;
-
-        let selected_option = if is_allow {
-            &selected_choice.allow
-        } else {
-            &selected_choice.deny
-        };
-
-        let params = if !selected_choice.sub_patterns.is_empty() {
-            Some(SelectedPermissionParams::Terminal {
-                patterns: selected_choice.sub_patterns.clone(),
-            })
-        } else {
-            None
-        };
-
-        let outcome =
-            SelectedPermissionOutcome::new(selected_option.option_id.clone()).params(params);
-
-        self.authorize_tool_call(
-            session_id,
-            tool_call_id,
-            outcome,
-            selected_option.kind,
-            window,
-            cx,
-        );
-
+        cx.notify();
         Some(())
     }
 
@@ -1842,7 +3375,7 @@ impl ThreadView {
         let thread = &self.thread;
         let telemetry = ActionLogTelemetry::from(thread.read(cx));
         let action_log = thread.read(cx).action_log().clone();
-        let has_changes = action_log.read(cx).changed_buffers(cx).len() > 0;
+        let has_changes = action_log.read(cx).changed_buffers(cx).next().is_some();
 
         action_log
             .update(cx, |action_log, cx| {
@@ -1893,128 +3426,15 @@ impl ThreadView {
 
     // thread stuff
 
-    fn share_thread(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some((thread, project)) = self.as_native_thread(cx).zip(self.project.upgrade()) else {
-            return;
-        };
-
-        let client = project.read(cx).client();
-        let workspace = self.workspace.clone();
-        let session_id = thread.read(cx).id().to_string();
-
-        let load_task = thread.read(cx).to_db(cx);
-
-        cx.spawn(async move |_this, cx| {
-            let db_thread = load_task.await;
-
-            let shared_thread = SharedThread::from_db_thread(&db_thread);
-            let thread_data = shared_thread.to_bytes()?;
-            let title = shared_thread.title.to_string();
-
-            client
-                .request(proto::ShareAgentThread {
-                    session_id: session_id.clone(),
-                    title,
-                    thread_data,
-                })
-                .await?;
-
-            let share_url = client::zed_urls::shared_agent_thread_url(&session_id);
-
-            cx.update(|cx| {
-                if let Some(workspace) = workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        struct ThreadSharedToast;
-                        workspace.show_toast(
-                            Toast::new(
-                                NotificationId::unique::<ThreadSharedToast>(),
-                                "Thread shared!",
-                            )
-                            .on_click(
-                                "Copy URL",
-                                move |_window, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        share_url.clone(),
-                                    ));
-                                },
-                            ),
-                            cx,
-                        );
-                    });
-                }
-            });
-
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
-    }
-
-    pub fn sync_thread(
-        &mut self,
-        project: Entity<Project>,
-        server_view: Entity<ConversationView>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.is_imported_thread(cx) {
-            return;
-        }
-
-        let Some(session_list) = self
-            .as_native_connection(cx)
-            .and_then(|connection| connection.session_list(cx))
-            .and_then(|list| list.downcast::<NativeAgentSessionList>())
-        else {
-            return;
-        };
-        let thread_store = session_list.thread_store().clone();
-
-        let client = project.read(cx).client();
-        let session_id = self.thread.read(cx).session_id().clone();
-        cx.spawn_in(window, async move |this, cx| {
-            let response = client
-                .request(proto::GetSharedAgentThread {
-                    session_id: session_id.to_string(),
-                })
-                .await?;
-
-            let shared_thread = SharedThread::from_bytes(&response.thread_data)?;
-
-            let db_thread = shared_thread.to_db_thread();
-
-            thread_store
-                .update(&mut cx.clone(), |store, cx| {
-                    store.save_thread(session_id.clone(), db_thread, Default::default(), cx)
-                })
-                .await?;
-
-            server_view.update_in(cx, |server_view, window, cx| server_view.reset(window, cx))?;
-
-            this.update_in(cx, |this, _window, cx| {
-                if let Some(workspace) = this.workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        struct ThreadSyncedToast;
-                        workspace.show_toast(
-                            Toast::new(
-                                NotificationId::unique::<ThreadSyncedToast>(),
-                                "Thread synced with latest version",
-                            )
-                            .autohide(),
-                            cx,
-                        );
-                    });
-                }
-            })?;
-
-            anyhow::Ok(())
-        })
-        .detach_and_log_err(cx);
-    }
-
-    pub fn restore_checkpoint(&mut self, message_id: &UserMessageId, cx: &mut Context<Self>) {
+    pub fn restore_checkpoint(&mut self, client_id: &ClientUserMessageId, cx: &mut Context<Self>) {
         self.thread
             .update(cx, |thread, cx| {
-                thread.restore_checkpoint(message_id.clone(), cx)
+                telemetry::event!(
+                    "Agent Checkpoint Restored",
+                    agent = thread.connection().telemetry_id(),
+                    session = thread.session_id().clone(),
+                );
+                thread.restore_checkpoint(client_id.clone(), cx)
             })
             .detach_and_log_err(cx);
     }
@@ -2057,10 +3477,35 @@ impl ThreadView {
         telemetry::event!("Follow Agent Selected", following = !following);
     }
 
-    // other
+    fn callout_border_position(&self) -> CalloutBorderPosition {
+        if self.list_state.item_count() > 0 {
+            CalloutBorderPosition::Top
+        } else {
+            CalloutBorderPosition::Bottom
+        }
+    }
 
-    pub fn render_thread_retry_status_callout(&self) -> Option<Callout> {
+    pub fn render_thread_retry_status_callout(&self, cx: &mut Context<Self>) -> Option<Callout> {
         let state = self.thread_retry_status.as_ref()?;
+
+        if let Some(fallback_model) = acp_thread::refusal_fallback_model_from_meta(&state.meta) {
+            return Some(
+                Callout::new()
+                    .icon(IconName::Warning)
+                    .severity(Severity::Warning)
+                    .title(state.last_error.clone())
+                    .description(format!("Retrying with {fallback_model}"))
+                    .dismiss_action(
+                        IconButton::new("dismiss-refusal-fallback", IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Dismiss"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.thread_retry_status = None;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
 
         let next_attempt_in = state
             .duration
@@ -2091,48 +3536,12 @@ impl ThreadView {
 
         Some(
             Callout::new()
+                .border_position(self.callout_border_position())
                 .icon(IconName::Warning)
                 .severity(Severity::Warning)
                 .title(state.last_error.clone())
                 .description(retry_message),
         )
-    }
-
-    pub fn handle_open_rules(
-        &mut self,
-        _: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(thread) = self.as_native_thread(cx) else {
-            return;
-        };
-        let project_context = thread.read(cx).project_context().read(cx);
-
-        let project_entry_ids = project_context
-            .worktrees
-            .iter()
-            .flat_map(|worktree| worktree.rules_file.as_ref())
-            .map(|rules_file| ProjectEntryId::from_usize(rules_file.project_entry_id))
-            .collect::<Vec<_>>();
-
-        self.workspace
-            .update(cx, move |workspace, cx| {
-                // TODO: Open a multibuffer instead? In some cases this doesn't make the set of rules
-                // files clear. For example, if rules file 1 is already open but rules file 2 is not,
-                // this would open and focus rules file 2 in a tab that is not next to rules file 1.
-                let project = workspace.project().read(cx);
-                let project_paths = project_entry_ids
-                    .into_iter()
-                    .flat_map(|entry_id| project.path_for_entry(entry_id, cx))
-                    .collect::<Vec<_>>();
-                for project_path in project_paths {
-                    workspace
-                        .open_path(project_path, None, true, window, cx)
-                        .detach_and_log_err(cx);
-                }
-            })
-            .ok();
     }
 
     fn activity_bar_bg(&self, cx: &Context<Self>) -> Hsla {
@@ -2149,11 +3558,28 @@ impl ThreadView {
         let thread = self.thread.read(cx);
         let action_log = thread.action_log();
         let telemetry = ActionLogTelemetry::from(thread);
-        let changed_buffers = action_log.read(cx).changed_buffers(cx);
-        let plan = thread.plan();
+        let changed_buffers = action_log.read(cx).changed_buffers(cx).collect::<Vec<_>>();
+        let plan = thread.plan().filter(|plan| !plan.is_empty());
+        let has_plan = plan.is_some();
         let queue_is_empty = !self.has_queued_messages();
 
-        if changed_buffers.is_empty() && plan.is_empty() && queue_is_empty {
+        let awaiting_permission = self
+            .render_main_agent_awaiting_permission(window, cx)
+            .or_else(|| self.render_subagents_awaiting_permission(cx));
+        let generic_permissions = self.render_generic_permissions(cx);
+        let awaiting_permission = match (generic_permissions, awaiting_permission) {
+            (Some(generic), Some(legacy)) => Some(
+                v_flex()
+                    .child(generic)
+                    .child(Divider::horizontal().color(DividerColor::Border))
+                    .child(legacy)
+                    .into_any(),
+            ),
+            (generic, legacy) => generic.or(legacy),
+        };
+        let has_awaiting_permission = awaiting_permission.is_some();
+
+        if changed_buffers.is_empty() && !has_plan && queue_is_empty && !has_awaiting_permission {
             return None;
         }
 
@@ -2168,58 +3594,79 @@ impl ThreadView {
         let edits_expanded = self.edits_expanded;
         let queue_expanded = self.queue_expanded;
 
-        v_flex()
-            .mt_1()
-            .mx_2()
-            .bg(self.activity_bar_bg(cx))
-            .border_1()
-            .border_b_0()
-            .border_color(cx.theme().colors().border)
-            .rounded_t_md()
-            .shadow(vec![gpui::BoxShadow {
-                color: gpui::black().opacity(0.15),
-                offset: point(px(1.), px(-1.)),
-                blur_radius: px(3.),
-                spread_radius: px(0.),
-            }])
-            .when(!plan.is_empty(), |this| {
-                this.child(self.render_plan_summary(plan, window, cx))
-                    .when(plan_expanded, |parent| {
-                        parent.child(self.render_plan_entries(plan, window, cx))
+        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+        // Drop shadows have no opaque surface to blend into on a transparent
+        // window, so they render as a dark halo; only apply them when opaque.
+        let opaque_window =
+            cx.theme().window_background_appearance() == gpui::WindowBackgroundAppearance::Opaque;
+
+        h_flex()
+            .w_full()
+            .px_2()
+            .justify_center()
+            .child(
+                v_flex()
+                    .when_some(max_content_width, |this, max_w| this.flex_basis(max_w))
+                    .when(max_content_width.is_none(), |this| this.w_full())
+                    .flex_shrink_1()
+                    .flex_grow_0()
+                    .max_w_full()
+                    .bg(self.activity_bar_bg(cx))
+                    .border_1()
+                    .border_b_0()
+                    .border_color(cx.theme().colors().border)
+                    .rounded_t_md()
+                    .when(opaque_window, |this| {
+                        this.shadow(vec![
+                            gpui::BoxShadow::new(px(1.), px(-1.), gpui::black().opacity(0.12))
+                                .blur_radius(px(2.)),
+                        ])
                     })
-            })
-            .when(!plan.is_empty() && !changed_buffers.is_empty(), |this| {
-                this.child(Divider::horizontal().color(DividerColor::Border))
-            })
-            .when(
-                !changed_buffers.is_empty() && thread.parent_session_id().is_none(),
-                |this| {
-                    this.child(self.render_edits_summary(
-                        &changed_buffers,
-                        edits_expanded,
-                        pending_edits,
-                        cx,
-                    ))
-                    .when(edits_expanded, |parent| {
-                        parent.child(self.render_edited_files(
-                            action_log,
-                            telemetry.clone(),
-                            &changed_buffers,
-                            pending_edits,
-                            cx,
-                        ))
+                    .when_some(awaiting_permission, |this, element| this.child(element))
+                    .when(
+                        has_awaiting_permission
+                            && (has_plan || !changed_buffers.is_empty() || !queue_is_empty),
+                        |this| this.child(Divider::horizontal().color(DividerColor::Border)),
+                    )
+                    .when_some(plan, |this, plan| {
+                        this.child(self.render_plan_summary(plan, window, cx))
+                            .when(plan_expanded, |parent| {
+                                parent.child(self.render_plan_entries(plan, window, cx))
+                            })
                     })
-                },
+                    .when(has_plan && !changed_buffers.is_empty(), |this| {
+                        this.child(Divider::horizontal().color(DividerColor::Border))
+                    })
+                    .when(
+                        !changed_buffers.is_empty() && thread.parent_session_id().is_none(),
+                        |this| {
+                            this.child(self.render_edits_summary(
+                                &changed_buffers,
+                                edits_expanded,
+                                pending_edits,
+                                cx,
+                            ))
+                            .when(edits_expanded, |parent| {
+                                parent.child(self.render_edited_files(
+                                    action_log,
+                                    telemetry.clone(),
+                                    &changed_buffers,
+                                    pending_edits,
+                                    cx,
+                                ))
+                            })
+                        },
+                    )
+                    .when(!queue_is_empty, |this| {
+                        this.when(has_plan || !changed_buffers.is_empty(), |this| {
+                            this.child(Divider::horizontal().color(DividerColor::Border))
+                        })
+                        .child(self.render_message_queue_summary(window, cx))
+                        .when(queue_expanded, |parent| {
+                            parent.child(self.render_message_queue_entries(window, cx))
+                        })
+                    }),
             )
-            .when(!queue_is_empty, |this| {
-                this.when(!plan.is_empty() || !changed_buffers.is_empty(), |this| {
-                    this.child(Divider::horizontal().color(DividerColor::Border))
-                })
-                .child(self.render_message_queue_summary(window, cx))
-                .when(queue_expanded, |parent| {
-                    parent.child(self.render_message_queue_entries(window, cx))
-                })
-            })
             .into_any()
             .into()
     }
@@ -2228,7 +3675,7 @@ impl ThreadView {
         &self,
         action_log: &Entity<ActionLog>,
         telemetry: ActionLogTelemetry,
-        changed_buffers: &BTreeMap<Entity<Buffer>, Entity<BufferDiff>>,
+        changed_buffers: &[(Entity<Buffer>, Entity<BufferDiff>)],
         pending_edits: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -2246,15 +3693,16 @@ impl ThreadView {
             .id("edited_files_list")
             .max_h_40()
             .overflow_y_scroll()
-            .children(
-                sorted_buffers
-                    .into_iter()
-                    .enumerate()
-                    .flat_map(|(index, (buffer, diff))| {
+            .child(
+                v_flex().children(sorted_buffers.into_iter().enumerate().flat_map(
+                    |(index, (buffer, diff))| {
                         let file = buffer.read(cx).file()?;
                         let path = file.path();
                         let path_style = file.path_style(cx);
                         let separator = file.path_style(cx).primary_separator();
+
+                        let fallback_full_path =
+                            full_path_for_empty_project_path(file.as_ref(), cx);
 
                         let file_path = path.parent().and_then(|parent| {
                             if parent.is_empty() {
@@ -2272,14 +3720,25 @@ impl ThreadView {
                             }
                         });
 
-                        let file_name = path.file_name().map(|name| {
-                            Label::new(name.to_string())
-                                .size(LabelSize::XSmall)
-                                .buffer_font(cx)
-                                .ml_1()
-                        });
+                        let file_name = path
+                            .file_name()
+                            .map(|name| {
+                                Label::new(name.to_string())
+                                    .size(LabelSize::XSmall)
+                                    .buffer_font(cx)
+                                    .ml_1()
+                            })
+                            .or_else(|| {
+                                fallback_full_path.as_ref().map(|path| {
+                                    Label::new(path.clone())
+                                        .size(LabelSize::XSmall)
+                                        .buffer_font(cx)
+                                        .ml_1()
+                                })
+                            });
 
-                        let full_path = path.display(path_style).to_string();
+                        let full_path = fallback_full_path
+                            .unwrap_or_else(|| path.display(path_style).to_string());
 
                         let file_icon = FileIcons::get_icon(path.as_std_path(), cx)
                             .map(Icon::from_path)
@@ -2290,7 +3749,7 @@ impl ThreadView {
                                     .size(IconSize::Small)
                             });
 
-                        let file_stats = DiffStats::single_file(buffer.read(cx), diff.read(cx), cx);
+                        let file_stats = DiffStats::single_file(diff.read(cx));
 
                         let buttons = self.render_edited_files_buttons(
                             index,
@@ -2353,7 +3812,8 @@ impl ThreadView {
                             .child(buttons);
 
                         Some(element)
-                    }),
+                    },
+                )),
             )
             .into_any_element()
     }
@@ -2441,12 +3901,397 @@ impl ThreadView {
             )
     }
 
+    fn collect_subagent_items_for_sessions(
+        entries: &[AgentThreadEntry],
+        awaiting_session_ids: &[acp_v2::SessionId],
+        cx: &App,
+    ) -> Vec<(SharedString, usize)> {
+        let tool_calls_by_session: HashMap<_, _> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(entry_ix, entry)| {
+                let AgentThreadEntry::ToolCall(tool_call) = entry else {
+                    return None;
+                };
+                let info = tool_call.subagent_session_info.as_ref()?;
+                let summary_text = tool_call.label.read(cx).source().to_string();
+                let subagent_summary = if summary_text.is_empty() {
+                    SharedString::from("Subagent")
+                } else {
+                    SharedString::from(summary_text)
+                };
+                Some((info.session_id.clone(), (subagent_summary, entry_ix)))
+            })
+            .collect();
+
+        awaiting_session_ids
+            .iter()
+            .filter_map(|session_id| tool_calls_by_session.get(session_id).cloned())
+            .collect()
+    }
+
+    fn render_generic_permissions(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let conversation = self.conversation.read(cx);
+        let mut cards = Vec::new();
+        for (session_id, request_ids) in &conversation.permission_requests {
+            if self.is_subagent() && session_id != &self.session_id {
+                continue;
+            }
+            let Some(thread) = conversation.threads.get(session_id) else {
+                continue;
+            };
+            let thread = thread.read(cx);
+            for request_id in request_ids {
+                let Some(request) = thread
+                    .permission_request(*request_id)
+                    .and_then(PermissionRequest::generic_request)
+                else {
+                    continue;
+                };
+                let source = if session_id == &self.session_id {
+                    None
+                } else {
+                    Some(format!(
+                        "Subagent: {} ({session_id})",
+                        thread.title().unwrap_or_else(|| "Subagent".into())
+                    ))
+                };
+                cards.push(self.render_generic_permission_card(
+                    session_id.clone(),
+                    *request_id,
+                    request,
+                    source,
+                    cx,
+                ));
+            }
+        }
+        if cards.is_empty() {
+            return None;
+        }
+        Some(
+            v_flex()
+                .id("generic-permissions")
+                .max_h(px(320.0))
+                .overflow_y_scroll()
+                .children(cards)
+                .into_any(),
+        )
+    }
+
+    pub(super) fn render_generic_permission_card(
+        &self,
+        session_id: acp_v2::SessionId,
+        request_id: PermissionRequestId,
+        request: &acp_v2::RequestPermissionRequest,
+        source: Option<String>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let subject = match &request.subject {
+            Some(acp_v2::RequestPermissionSubject::Command(command)) => Some(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .debug_selector(|| {
+                                format!("generic-permission-command-{}", command.command)
+                            })
+                            .child(command.command.clone()),
+                    )
+                    .child(format!("Working directory: {}", command.cwd.0.display())),
+            ),
+            Some(acp_v2::RequestPermissionSubject::ToolCall(subject)) => Some(
+                v_flex()
+                    .debug_selector(|| {
+                        format!("generic-permission-tool-{}", subject.tool_call.tool_call_id)
+                    })
+                    .child(format!("Tool call: {}", subject.tool_call.tool_call_id)),
+            ),
+            Some(acp_v2::RequestPermissionSubject::Other(subject)) => Some(
+                v_flex()
+                    .debug_selector(|| format!("generic-permission-unknown-{}", subject.type_))
+                    .child(format!("Unknown permission subject: {}", subject.type_)),
+            ),
+            Some(_) => Some(v_flex().child("Unknown permission subject")),
+            None => None,
+        };
+        v_flex()
+            .id(format!("generic-permission-{request_id:?}"))
+            .debug_selector(|| format!("generic-permission-{request_id:?}"))
+            .p_2()
+            .gap_2()
+            .w_full()
+            .min_w_0()
+            .text_ui_sm(cx)
+            .children(source.map(|source| {
+                div()
+                    .debug_selector(|| format!("generic-permission-source-{session_id}"))
+                    .text_color(cx.theme().colors().text_muted)
+                    .child(source)
+            }))
+            .child(
+                div()
+                    .debug_selector(|| format!("generic-permission-title-{}", request.title))
+                    .child(request.title.clone()),
+            )
+            .children(request.description.as_ref().map(|description| {
+                div()
+                    .debug_selector(|| format!("generic-permission-description-{description}"))
+                    .child(description.clone())
+            }))
+            .children(subject)
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1()
+                    .flex_wrap()
+                    .children(request.options.iter().map(|option| {
+                        let option_id = option.option_id.clone();
+                        let session_id = session_id.clone();
+                        div()
+                            .min_w_0()
+                            .max_w_full()
+                            .debug_selector(|| {
+                                format!("generic-permission-option-{request_id:?}-{option_id}")
+                            })
+                            .child(
+                                Button::new(
+                                    format!("generic-permission-option-{request_id:?}-{option_id}"),
+                                    option.name.clone(),
+                                )
+                                .label_size(LabelSize::Small)
+                                .full_width()
+                                .truncate(true)
+                                .tooltip(Tooltip::text(option.name.clone()))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.conversation.update(cx, |conversation, cx| {
+                                            conversation.select_permission_option(
+                                                &session_id,
+                                                request_id,
+                                                option_id.clone(),
+                                                cx,
+                                            );
+                                        });
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                    }))
+                    .child(
+                        div()
+                            .debug_selector(|| format!("generic-permission-cancel-{request_id:?}"))
+                            .child(
+                                Button::new(
+                                    format!("generic-permission-cancel-{request_id:?}"),
+                                    "Cancel",
+                                )
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.conversation.update(cx, |conversation, cx| {
+                                            conversation.cancel_permission_request(
+                                                &session_id,
+                                                request_id,
+                                                cx,
+                                            );
+                                        });
+                                        cx.notify();
+                                    },
+                                )),
+                            ),
+                    ),
+            )
+            .into_any()
+    }
+
+    fn render_subagents_awaiting_permission(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let awaiting = self.conversation.read(cx).subagents_awaiting_permission(cx);
+
+        if awaiting.is_empty() {
+            return None;
+        }
+
+        let awaiting_session_ids: Vec<_> = awaiting
+            .iter()
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let subagent_items =
+            Self::collect_subagent_items_for_sessions(entries, &awaiting_session_ids, cx);
+
+        if subagent_items.is_empty() {
+            return None;
+        }
+
+        let item_count = subagent_items.len();
+
+        Some(
+            v_flex()
+                .child(
+                    h_flex()
+                        .py_1()
+                        .px_2()
+                        .w_full()
+                        .gap_1()
+                        .border_b_1()
+                        .border_color(cx.theme().colors().border)
+                        .child(
+                            Label::new("Subagents Awaiting Permission:")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new(item_count.to_string()).size(LabelSize::Small)),
+                )
+                .child(
+                    v_flex().children(subagent_items.into_iter().enumerate().map(
+                        |(ix, (label, entry_ix))| {
+                            let is_last = ix == item_count - 1;
+                            let group = format!("group-{}", entry_ix);
+
+                            h_flex()
+                                .cursor_pointer()
+                                .id(format!("subagent-permission-{}", entry_ix))
+                                .group(&group)
+                                .p_1()
+                                .pl_2()
+                                .min_w_0()
+                                .w_full()
+                                .gap_1()
+                                .justify_between()
+                                .bg(cx.theme().colors().editor_background)
+                                .hover(|s| s.bg(cx.theme().colors().element_hover))
+                                .when(!is_last, |this| {
+                                    this.border_b_1().border_color(cx.theme().colors().border)
+                                })
+                                .child(
+                                    h_flex()
+                                        .gap_1p5()
+                                        .child(
+                                            Icon::new(IconName::Circle)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Warning),
+                                        )
+                                        .child(
+                                            Label::new(label)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                                .truncate(),
+                                        ),
+                                )
+                                .child(
+                                    div().visible_on_hover(&group).child(
+                                        Label::new("Scroll to Subagent")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted)
+                                            .truncate(),
+                                    ),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.list_state.scroll_to(ListOffset {
+                                        item_ix: entry_ix,
+                                        offset_in_item: px(0.0),
+                                    });
+                                    cx.notify();
+                                }))
+                        },
+                    )),
+                )
+                .into_any(),
+        )
+    }
+
+    pub(crate) fn render_main_agent_awaiting_permission(
+        &self,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.is_subagent() {
+            return None;
+        }
+
+        let active_session_id = self.thread.read(cx).session_id().clone();
+        let conversation = self.conversation.read(cx);
+        let tool_call_id = conversation.pending_tool_call_for_session(&active_session_id, cx)?;
+        let pending_count =
+            conversation.pending_tool_call_count_for_session(&active_session_id, cx);
+
+        let thread = self.thread.read(cx);
+        let (entry_ix, tool_call) = thread.tool_call(&tool_call_id)?;
+
+        let scroll_icon = if self.list_state.item_is_above_viewport(entry_ix)? {
+            IconName::ArrowUp
+        } else if self.list_state.item_is_below_viewport(entry_ix)? {
+            IconName::ArrowDown
+        } else {
+            return None;
+        };
+
+        let focus_handle = self.focus_handle(cx);
+
+        let card = self.render_any_tool_call(
+            &active_session_id,
+            entry_ix,
+            tool_call,
+            &focus_handle,
+            ToolCallLayout::Floating,
+            window,
+            cx,
+        );
+
+        let label: SharedString = if pending_count > 1 {
+            format!("Awaiting Confirmation ({pending_count})").into()
+        } else {
+            "Awaiting Confirmation".into()
+        };
+
+        let header = h_flex()
+            .p_1p5()
+            .pl_2()
+            .w_full()
+            .gap_1p5()
+            .justify_between()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(
+                        h_flex()
+                            .w_2()
+                            .justify_center()
+                            .child(GeneratingSpinnerElement::new(SpinnerVariant::Sand)),
+                    )
+                    .child(Label::new(label).size(LabelSize::Small).color(Color::Muted)),
+            )
+            .child(
+                Button::new("main-agent-permission-scroll-to", "Scroll")
+                    .label_size(LabelSize::Small)
+                    .end_icon(
+                        Icon::new(scroll_icon)
+                            .size(IconSize::XSmall)
+                            .color(Color::Default),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.list_state.scroll_to(ListOffset {
+                            item_ix: entry_ix,
+                            offset_in_item: px(0.0),
+                        });
+                        cx.notify();
+                    })),
+            );
+
+        Some(v_flex().child(header).child(card).into_any())
+    }
+
     fn render_message_queue_summary(
         &self,
         _window: &mut Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let queue_count = self.local_queued_messages.len();
+        let queue_count = self.message_queue.len();
         let title: SharedString = if queue_count == 1 {
             "1 Queued Message".into()
         } else {
@@ -2475,19 +4320,21 @@ impl ThreadView {
             .child(
                 Button::new("clear_queue", "Clear All")
                     .label_size(LabelSize::Small)
-                    .key_binding(KeyBinding::for_action(&ClearMessageQueue, cx))
+                    .key_binding(
+                        KeyBinding::for_action(&ClearMessageQueue, cx)
+                            .map(|kb| kb.size(rems_from_px(12_f32))),
+                    )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.clear_queue(cx);
-                        this.can_fast_track_queue = false;
-                        cx.notify();
                     })),
             )
             .into_any_element()
     }
 
     fn clear_queue(&mut self, cx: &mut Context<Self>) {
-        self.local_queued_messages.clear();
+        self.message_queue.clear();
         self.sync_queue_flag_to_native_thread(cx);
+        cx.notify();
     }
 
     fn render_plan_summary(
@@ -2520,7 +4367,7 @@ impl ThreadView {
                         .line_clamp(1)
                         .child(MarkdownElement::new(
                             entry.content.clone(),
-                            plan_label_markdown_style(&entry.status, window, cx),
+                            plan_label_markdown_style(&entry.source.status, window, cx),
                         )),
                 )
                 .when(stats.pending > 0, |this| {
@@ -2545,15 +4392,10 @@ impl ThreadView {
                     )
                 })
         } else {
-            let status_label = if stats.pending == 0 {
-                "All Done".to_string()
-            } else if stats.completed == 0 {
-                format!("{} Tasks", plan.entries.len())
-            } else {
-                format!("{}/{}", stats.completed, plan.entries.len())
-            };
+            let status_label = plan_summary_label(&stats, plan.entries.len());
 
             h_flex()
+                .debug_selector(|| format!("plan-status-{status_label}"))
                 .w_full()
                 .gap_1()
                 .justify_between()
@@ -2572,6 +4414,7 @@ impl ThreadView {
 
         h_flex()
             .id("plan_summary")
+            .debug_selector(|| "plan_summary".into())
             .p_1()
             .w_full()
             .gap_1()
@@ -2579,7 +4422,17 @@ impl ThreadView {
                 this.border_b_1().border_color(cx.theme().colors().border)
             })
             .child(Disclosure::new("plan_disclosure", plan_expanded))
-            .child(title)
+            .child(title.flex_1())
+            .child(
+                IconButton::new("dismiss-plan", IconName::Close)
+                    .icon_size(IconSize::XSmall)
+                    .shape(ui::IconButtonShape::Square)
+                    .tooltip(Tooltip::text("Clear Plan"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.thread.update(cx, |thread, cx| thread.clear_plan(cx));
+                        cx.stop_propagation();
+                    })),
+            )
             .on_click(cx.listener(|this, _, _, cx| {
                 this.plan_expanded = !this.plan_expanded;
                 cx.notify();
@@ -2597,59 +4450,234 @@ impl ThreadView {
             .id("plan_items_list")
             .max_h_40()
             .overflow_y_scroll()
-            .children(plan.entries.iter().enumerate().flat_map(|(index, entry)| {
-                let element = h_flex()
-                    .py_1()
-                    .px_2()
-                    .gap_2()
-                    .justify_between()
-                    .bg(cx.theme().colors().editor_background)
-                    .when(index < plan.entries.len() - 1, |parent| {
-                        parent.border_color(cx.theme().colors().border).border_b_1()
-                    })
-                    .child(
-                        h_flex()
-                            .id(("plan_entry", index))
-                            .gap_1p5()
-                            .max_w_full()
-                            .overflow_x_scroll()
-                            .text_xs()
-                            .text_color(cx.theme().colors().text_muted)
-                            .child(match entry.status {
-                                acp::PlanEntryStatus::InProgress => {
-                                    Icon::new(IconName::TodoProgress)
-                                        .size(IconSize::Small)
-                                        .color(Color::Accent)
-                                        .with_rotate_animation(2)
-                                        .into_any_element()
-                                }
-                                acp::PlanEntryStatus::Completed => {
-                                    Icon::new(IconName::TodoComplete)
-                                        .size(IconSize::Small)
-                                        .color(Color::Success)
-                                        .into_any_element()
-                                }
-                                acp::PlanEntryStatus::Pending | _ => {
-                                    Icon::new(IconName::TodoPending)
-                                        .size(IconSize::Small)
-                                        .color(Color::Muted)
-                                        .into_any_element()
-                                }
-                            })
-                            .child(MarkdownElement::new(
-                                entry.content.clone(),
-                                plan_label_markdown_style(&entry.status, window, cx),
-                            )),
-                    );
+            .child(
+                v_flex().children(plan.entries.iter().enumerate().flat_map(|(index, entry)| {
+                    let entry_bg = cx.theme().colors().editor_background;
+                    let tooltip_text: SharedString =
+                        entry.content.read(cx).source().to_string().into();
+                    let (icon_name, icon_color) = match &entry.source.status {
+                        acp_v2::PlanEntryStatus::InProgress => {
+                            (IconName::TodoProgress, Color::Accent)
+                        }
+                        acp_v2::PlanEntryStatus::Completed => {
+                            (IconName::TodoComplete, Color::Success)
+                        }
+                        acp_v2::PlanEntryStatus::Cancelled => (IconName::Close, Color::Muted),
+                        _ => (IconName::TodoPending, Color::Muted),
+                    };
+                    let icon = Icon::new(icon_name).size(IconSize::Small).color(icon_color);
+                    let icon = if matches!(entry.source.status, acp_v2::PlanEntryStatus::InProgress)
+                    {
+                        icon.with_rotate_animation(2).into_any_element()
+                    } else {
+                        icon.into_any_element()
+                    };
 
-                Some(element)
-            }))
+                    Some(
+                        h_flex()
+                            .id(("plan_entry_row", index))
+                            .debug_selector(|| format!("plan-entry-{index}-{icon_name:?}"))
+                            .py_1()
+                            .px_2()
+                            .gap_2()
+                            .justify_between()
+                            .relative()
+                            .bg(entry_bg)
+                            .when(index < plan.entries.len() - 1, |parent| {
+                                parent.border_color(cx.theme().colors().border).border_b_1()
+                            })
+                            .overflow_hidden()
+                            .child(
+                                h_flex()
+                                    .id(("plan_entry", index))
+                                    .gap_1p5()
+                                    .min_w_0()
+                                    .text_xs()
+                                    .text_color(cx.theme().colors().text_muted)
+                                    .child(icon)
+                                    .child(MarkdownElement::new(
+                                        entry.content.clone(),
+                                        plan_label_markdown_style(&entry.source.status, window, cx),
+                                    )),
+                            )
+                            .child(div().absolute().top_0().right_0().h_full().w_8().bg(
+                                linear_gradient(
+                                    90.,
+                                    linear_color_stop(entry_bg, 1.),
+                                    linear_color_stop(entry_bg.opacity(0.), 0.),
+                                ),
+                            ))
+                            .tooltip(Tooltip::text(tooltip_text)),
+                    )
+                })),
+            )
             .into_any_element()
+    }
+
+    fn render_context_compaction(
+        &self,
+        entry_ix: usize,
+        compaction: &acp_thread::ContextCompaction,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let is_compacting = compaction.is_in_progress();
+        let summary = &compaction.summary;
+        let error = compaction.error.clone();
+        let has_details = summary.blocks().len() > 0 || error.is_some();
+        let is_expanded = self
+            .entry_view_state
+            .read(cx)
+            .is_compaction_expanded(entry_ix);
+        let details = (is_expanded && has_details).then_some((summary, error));
+
+        let id = format!("context-compaction-{entry_ix}");
+        let header_label = match &compaction.status {
+            acp_thread::ContextCompactionStatus::InProgress => "Compacting Context…",
+            acp_thread::ContextCompactionStatus::Completed => "Context Compacted",
+            acp_thread::ContextCompactionStatus::Failed => "Compaction Failed",
+            acp_thread::ContextCompactionStatus::Canceled => "Compaction Canceled",
+            acp_thread::ContextCompactionStatus::Other(_) => "Context Compaction",
+        };
+        let chevron_end = if is_expanded {
+            IconName::ChevronUp
+        } else {
+            IconName::ChevronDown
+        };
+        let header = h_flex()
+            .gap_1()
+            .w_full()
+            .child(Divider::horizontal())
+            .child(
+                Button::new(id, header_label)
+                    .label_size(LabelSize::Small)
+                    .loading(is_compacting)
+                    .disabled(!has_details)
+                    .start_icon(
+                        Icon::new(IconName::Compact)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .when(has_details, |this| {
+                        this.end_icon(
+                            Icon::new(chevron_end)
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .on_click(cx.listener(
+                            move |this, _event: &ClickEvent, window, cx| {
+                                this.toggle_compaction_expansion(entry_ix, window, cx);
+                            },
+                        ))
+                    }),
+            )
+            .child(Divider::horizontal());
+
+        div()
+            .px_5()
+            .w_full()
+            .child(
+                v_flex()
+                    .pt_1p5()
+                    .mb_1p5()
+                    .gap_1p5()
+                    .border_1()
+                    .border_color(gpui::transparent_black())
+                    .rounded_sm()
+                    .child(header)
+                    .when_some(details, |this, (summary, error)| {
+                        this.border_color(self.tool_card_border_color(cx))
+                            .bg(cx.theme().colors().editor_background.opacity(0.2))
+                            .when(summary.blocks().len() > 0, |this| {
+                                this.child(
+                                    v_flex()
+                                        .id(("compaction-summary", entry_ix))
+                                        .p_2()
+                                        .gap_2()
+                                        .text_ui(cx)
+                                        .children(summary.blocks().enumerate().map(
+                                            |(content_ix, content)| {
+                                                self.render_output_content_block(
+                                                    entry_ix, content_ix, content, None, true,
+                                                    window, cx,
+                                                )
+                                            },
+                                        )),
+                                )
+                            })
+                            .when_some(error, |this, error| {
+                                let mut style =
+                                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                                style.base_text_style.color = Color::Error.color(cx);
+                                this.child(
+                                    div()
+                                        .id(("compaction-error", entry_ix))
+                                        .p_2()
+                                        .child(self.render_markdown(error, style, cx)),
+                                )
+                            })
+                            .child(
+                                h_flex()
+                                    .border_t_1()
+                                    .border_color(self.tool_card_border_color(cx))
+                                    .child(
+                                        IconButton::new(
+                                            ("compaction-summary-collapse", entry_ix),
+                                            IconName::ChevronUp,
+                                        )
+                                        .full_width()
+                                        .on_click(
+                                            cx.listener(
+                                                move |this, _event: &ClickEvent, window, cx| {
+                                                    this.entry_view_state.update(
+                                                        cx,
+                                                        |state, _cx| {
+                                                            state.collapse_compaction(entry_ix);
+                                                        },
+                                                    );
+                                                    this.refresh_thread_search(window, cx);
+                                                    cx.notify();
+                                                },
+                                            ),
+                                        ),
+                                    ),
+                            )
+                    }),
+            )
+            .into_any()
+    }
+
+    pub(super) fn toggle_compaction_expansion(
+        &mut self,
+        entry_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // If tail following is active and the entry is not yet expanded, we'll
+        // want to anchor the list's scroll position, to prevent it from
+        // automatically scrolling to the end of the compaction context element,
+        // which would feel off, as we assume the user is trying to read it from
+        // top to bottom.
+        if self.list_state.is_following_tail()
+            && !self
+                .entry_view_state
+                .read(cx)
+                .is_compaction_expanded(entry_ix)
+        {
+            self.list_state.pause_following_tail();
+        }
+
+        self.entry_view_state.update(cx, |state, _cx| {
+            state.toggle_compaction_expansion(entry_ix);
+        });
+        self.list_state.remeasure_items(entry_ix..entry_ix + 1);
+        self.refresh_thread_search(window, cx);
+        cx.notify();
     }
 
     fn render_edits_summary(
         &self,
-        changed_buffers: &BTreeMap<Entity<Buffer>, Entity<BufferDiff>>,
+        changed_buffers: &[(Entity<Buffer>, Entity<BufferDiff>)],
         expanded: bool,
         pending_edits: bool,
         cx: &Context<Self>,
@@ -2694,7 +4722,7 @@ impl ThreadView {
                                 ),
                             )
                         } else {
-                            let stats = DiffStats::all_files(changed_buffers, cx);
+                            let stats = DiffStats::all_files(changed_buffers.iter().cloned(), cx);
                             let dot_divider = || {
                                 Label::new("•")
                                     .size(LabelSize::XSmall)
@@ -2764,7 +4792,7 @@ impl ThreadView {
                             })
                             .key_binding(
                                 KeyBinding::for_action_in(&RejectAll, &focus_handle.clone(), cx)
-                                    .map(|kb| kb.size(rems_from_px(10.))),
+                                    .map(|kb| kb.size(rems_from_px(12_f32))),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.reject_all(&RejectAll, window, cx);
@@ -2779,7 +4807,7 @@ impl ThreadView {
                             })
                             .key_binding(
                                 KeyBinding::for_action_in(&KeepAll, &focus_handle, cx)
-                                    .map(|kb| kb.size(rems_from_px(10.))),
+                                    .map(|kb| kb.size(rems_from_px(12_f32))),
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.keep_all(&KeepAll, window, cx);
@@ -2789,7 +4817,7 @@ impl ThreadView {
     }
 
     fn is_subagent_canceled_or_failed(&self, cx: &App) -> bool {
-        let Some(parent_session_id) = self.parent_id.as_ref() else {
+        let Some(parent_session_id) = self.parent_session_id.as_ref() else {
             return false;
         };
 
@@ -2806,7 +4834,7 @@ impl ThreadView {
                     .tool_call_for_subagent(&my_session_id)
                     .is_some_and(|tc| {
                         matches!(
-                            tc.status,
+                            tc.status(),
                             ToolCallStatus::Canceled
                                 | ToolCallStatus::Failed
                                 | ToolCallStatus::Rejected
@@ -2816,23 +4844,22 @@ impl ThreadView {
     }
 
     pub(crate) fn render_subagent_titlebar(&mut self, cx: &mut Context<Self>) -> Option<Div> {
-        let Some(parent_session_id) = self.parent_id.clone() else {
+        if self.parent_session_id.is_none() {
             return None;
-        };
+        }
+        let parent_session_id = self.thread.read(cx).parent_session_id()?.clone();
 
         let server_view = self.server_view.clone();
         let thread = self.thread.clone();
         let is_done = thread.read(cx).status() == ThreadStatus::Idle;
         let is_canceled_or_failed = self.is_subagent_canceled_or_failed(cx);
 
+        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+
         Some(
             h_flex()
-                .h(Tab::container_height(cx))
-                .pl_2()
-                .pr_1p5()
                 .w_full()
-                .justify_between()
-                .gap_1()
+                .h(Tab::container_height(cx))
                 .border_b_1()
                 .when(is_done && is_canceled_or_failed, |this| {
                     this.border_dashed()
@@ -2841,50 +4868,60 @@ impl ThreadView {
                 .bg(cx.theme().colors().editor_background.opacity(0.2))
                 .child(
                     h_flex()
-                        .flex_1()
-                        .gap_2()
+                        .size_full()
+                        .when_some(max_content_width, |this, max_w| this.max_w(max_w).mx_auto())
+                        .pl_2()
+                        .pr_1()
+                        .flex_shrink_0()
+                        .justify_between()
+                        .gap_1()
                         .child(
-                            Icon::new(IconName::ForwardArrowUp)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(self.title_editor.clone())
-                        .when(is_done && is_canceled_or_failed, |this| {
-                            this.child(Icon::new(IconName::Close).color(Color::Error))
-                        })
-                        .when(is_done && !is_canceled_or_failed, |this| {
-                            this.child(Icon::new(IconName::Check).color(Color::Success))
-                        }),
-                )
-                .child(
-                    h_flex()
-                        .gap_0p5()
-                        .when(!is_done, |this| {
-                            this.child(
-                                IconButton::new("stop_subagent", IconName::Stop)
-                                    .icon_size(IconSize::Small)
-                                    .icon_color(Color::Error)
-                                    .tooltip(Tooltip::text("Stop Subagent"))
-                                    .on_click(move |_, _, cx| {
-                                        thread.update(cx, |thread, cx| {
-                                            thread.cancel(cx).detach();
-                                        });
-                                    }),
-                            )
-                        })
-                        .child(
-                            IconButton::new("minimize_subagent", IconName::Minimize)
-                                .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text("Minimize Subagent"))
-                                .on_click(move |_, window, cx| {
-                                    let _ = server_view.update(cx, |server_view, cx| {
-                                        server_view.navigate_to_session(
-                                            parent_session_id.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    });
+                            h_flex()
+                                .flex_1()
+                                .gap_2()
+                                .child(
+                                    Icon::new(IconName::ForwardArrowUp)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(self.title_editor.clone())
+                                .when(is_done && is_canceled_or_failed, |this| {
+                                    this.child(Icon::new(IconName::Close).color(Color::Error))
+                                })
+                                .when(is_done && !is_canceled_or_failed, |this| {
+                                    this.child(Icon::new(IconName::Check).color(Color::Success))
                                 }),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_0p5()
+                                .when(!is_done, |this| {
+                                    this.child(
+                                        IconButton::new("stop_subagent", IconName::Stop)
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(Color::Error)
+                                            .tooltip(Tooltip::text("Stop Subagent"))
+                                            .on_click(move |_, _, cx| {
+                                                thread.update(cx, |thread, cx| {
+                                                    thread.cancel(cx).detach();
+                                                });
+                                            }),
+                                    )
+                                })
+                                .child(
+                                    IconButton::new("minimize_subagent", IconName::Dash)
+                                        .icon_size(IconSize::Small)
+                                        .tooltip(Tooltip::text("Minimize Subagent"))
+                                        .on_click(move |_, window, cx| {
+                                            let _ = server_view.update(cx, |server_view, cx| {
+                                                server_view.navigate_to_thread(
+                                                    parent_session_id.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                ),
                         ),
                 ),
         )
@@ -2901,124 +4938,173 @@ impl ThreadView {
 
         let focus_handle = self.message_editor.focus_handle(cx);
         let editor_bg_color = cx.theme().colors().editor_background;
+
         let editor_expanded = self.editor_expanded;
-        let has_messages = self.list_state.item_count() > 0;
-        let v2_empty_state = cx.has_flag::<AgentV2FeatureFlag>() && !has_messages;
         let (expand_icon, expand_tooltip) = if editor_expanded {
             (IconName::Minimize, "Minimize Message Editor")
         } else {
             (IconName::Maximize, "Expand Message Editor")
         };
 
-        if v2_empty_state {
-            self.message_editor.update(cx, |editor, cx| {
-                editor.set_mode(
-                    EditorMode::Full {
-                        scale_ui_elements_with_buffer_font_size: false,
-                        show_active_line_background: false,
-                        sizing_behavior: SizingBehavior::Default,
-                    },
-                    cx,
-                );
-            });
-        } else {
-            self.message_editor.update(cx, |editor, cx| {
-                editor.set_mode(
-                    EditorMode::AutoHeight {
-                        min_lines: AgentSettings::get_global(cx).message_editor_min_lines,
-                        max_lines: Some(
-                            AgentSettings::get_global(cx).set_message_editor_max_lines(),
-                        ),
-                    },
-                    cx,
-                );
-            });
-        }
+        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+        let has_messages = self.list_state.item_count() > 0;
+        let fills_container = !has_messages || editor_expanded;
+        let composer_is_read_only = self.message_editor.read(cx).editor().read(cx).read_only(cx);
+        let discard_draft_button = composer_is_read_only.then(|| {
+            div()
+                .debug_selector(|| "discard-protected-draft".into())
+                .child(
+                    Button::new("discard-protected-draft", "Discard draft")
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this._draft_resolve_task.take();
+                            this.message_editor.update(cx, |editor, cx| {
+                                editor.set_read_only(false, cx);
+                                editor.set_message(Vec::new(), window, cx);
+                            });
+                            this.clear_thread_error(cx);
+                        })),
+                )
+        });
 
-        v_flex()
-            .on_action(cx.listener(Self::expand_message_editor))
-            .p_2()
-            .gap_2()
-            .when(!v2_empty_state, |this| {
-                this.border_t_1().border_color(cx.theme().colors().border)
-            })
+        h_flex()
+            .py_2()
             .bg(editor_bg_color)
-            .when(v2_empty_state, |this| this.flex_1().size_full())
-            .when(editor_expanded && !v2_empty_state, |this| {
-                this.h(vh(0.8, window)).size_full().justify_between()
+            .justify_center()
+            .on_action(cx.listener(Self::handle_message_editor_move_up))
+            .map(|this| {
+                if has_messages {
+                    this.on_action(cx.listener(Self::expand_message_editor))
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border)
+                        .when(editor_expanded, |this| this.h(vh(0.8, window)))
+                } else {
+                    this.flex_1().size_full()
+                }
             })
             .child(
                 v_flex()
-                    .relative()
-                    .size_full()
-                    .when(v2_empty_state, |this| this.flex_1())
-                    .pt_1()
-                    .pr_2p5()
-                    .child(self.message_editor.clone())
-                    .when(!v2_empty_state, |this| {
-                        this.child(
-                            h_flex()
-                                .absolute()
-                                .top_0()
-                                .right_0()
-                                .opacity(0.5)
-                                .hover(|this| this.opacity(1.0))
-                                .child(
-                                    IconButton::new("toggle-height", expand_icon)
-                                        .icon_size(IconSize::Small)
-                                        .icon_color(Color::Muted)
-                                        .tooltip({
-                                            move |_window, cx| {
-                                                Tooltip::for_action_in(
-                                                    expand_tooltip,
-                                                    &ExpandMessageEditor,
-                                                    &focus_handle,
-                                                    cx,
-                                                )
-                                            }
-                                        })
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.expand_message_editor(
-                                                &ExpandMessageEditor,
-                                                window,
-                                                cx,
-                                            );
-                                        })),
-                                ),
-                        )
-                    }),
-            )
-            .child(
-                h_flex()
-                    .flex_none()
-                    .flex_wrap()
+                    .when_some(max_content_width, |this, max_w| this.flex_basis(max_w))
+                    .when(max_content_width.is_none(), |this| this.w_full())
+                    .min_w_0()
+                    .when(fills_container, |this| this.h_full())
+                    .px_2()
+                    .flex_shrink_1()
+                    .flex_grow_0()
                     .justify_between()
+                    .gap_2()
                     .child(
-                        h_flex()
-                            .gap_0p5()
-                            .child(self.render_add_context_button(cx))
-                            .child(self.render_follow_toggle(cx))
-                            .children(self.render_fast_mode_control(cx))
-                            .children(self.render_thinking_control(cx)),
+                        v_flex()
+                            .relative()
+                            .w_full()
+                            .min_h_0()
+                            .when(fills_container, |this| this.flex_1())
+                            .pt_1()
+                            .pr_2p5()
+                            .child(self.message_editor.clone())
+                            .when(has_messages, |this| {
+                                this.child(
+                                    h_flex()
+                                        .absolute()
+                                        .top_0()
+                                        .right_0()
+                                        .opacity(0.5)
+                                        .hover(|s| s.opacity(1.0))
+                                        .child(
+                                            IconButton::new("toggle-height", expand_icon)
+                                                .icon_size(IconSize::Small)
+                                                .icon_color(Color::Muted)
+                                                .tooltip({
+                                                    move |_window, cx| {
+                                                        Tooltip::for_action_in(
+                                                            expand_tooltip,
+                                                            &ExpandMessageEditor,
+                                                            &focus_handle,
+                                                            cx,
+                                                        )
+                                                    }
+                                                })
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.expand_message_editor(
+                                                        &ExpandMessageEditor,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                })),
+                                        ),
+                                )
+                            }),
                     )
                     .child(
                         h_flex()
-                            .gap_1()
-                            .children(self.render_token_usage(cx))
-                            .children(self.profile_selector.clone())
-                            .map(|this| {
-                                // Either config_options_view OR (mode_selector + model_selector)
-                                match self.config_options_view.clone() {
-                                    Some(config_view) => this.child(config_view),
-                                    None => this
-                                        .children(self.mode_selector.clone())
-                                        .children(self.model_selector.clone()),
-                                }
-                            })
-                            .child(self.render_send_button(cx)),
+                            .w_full()
+                            .min_w_0()
+                            .flex_none()
+                            .flex_wrap()
+                            .justify_between()
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .flex_wrap()
+                                    .gap_0p5()
+                                    .child(self.render_add_context_button(cx))
+                                    .child(self.render_follow_toggle(cx))
+                                    .children(self.render_fast_mode_control(cx))
+                                    .children(self.render_thinking_control(cx)),
+                            )
+                            .child(
+                                h_flex()
+                                    .min_w_0()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(discard_draft_button)
+                                    .children(self.render_token_usage(cx))
+                                    .children(self.profile_selector.clone())
+                                    .map(|this| match self.config_options_view.clone() {
+                                        Some(config_view) => this.child(config_view),
+                                        None => this
+                                            .children(self.mode_selector.clone())
+                                            .children(self.model_selector.clone()),
+                                    })
+                                    .child(self.render_send_button(cx)),
+                            ),
                     ),
             )
             .into_any()
+    }
+
+    fn render_queue_steer_button(
+        &self,
+        entry_id: QueueEntryId,
+        index: usize,
+        is_next: bool,
+        steer_on: bool,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let focus_handle = self.message_editor.focus_handle(cx);
+
+        Button::new(("steer", index), "Steer")
+            .label_size(LabelSize::Small)
+            .toggle_state(steer_on)
+            .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+            .when(is_next, |this| {
+                this.key_binding(
+                    KeyBinding::for_action_in(&ToggleSteerFirstQueuedMessage, &focus_handle, cx)
+                        .map(|kb| kb.size(rems_from_px(12_f32))),
+                )
+            })
+            .tooltip(move |_window, cx| {
+                Tooltip::with_meta(
+                    "Steer",
+                    None,
+                    "Interrupt the agent at its next step to send this message. \
+                     When off, queued messages wait for the agent to finish.",
+                    cx,
+                )
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_queue_entry_steer(entry_id, cx);
+            }))
     }
 
     fn render_message_queue_entries(
@@ -3029,176 +5115,178 @@ impl ThreadView {
         let message_editor = self.message_editor.read(cx);
         let focus_handle = message_editor.focus_handle(cx);
 
-        let queued_message_editors = &self.queued_message_editors;
-        let queue_len = queued_message_editors.len();
-        let can_fast_track = self.can_fast_track_queue && queue_len > 0;
+        let queue_len = self.message_queue.len();
+        let can_fast_track = self.message_queue.can_fast_track();
+        let is_native = self.as_native_thread(cx).is_some();
 
         v_flex()
             .id("message_queue_list")
             .max_h_40()
             .overflow_y_scroll()
-            .children(
-                queued_message_editors
-                    .iter()
-                    .enumerate()
-                    .map(|(index, editor)| {
-                        let is_next = index == 0;
-                        let (icon_color, tooltip_text) = if is_next {
-                            (Color::Accent, "Next in Queue")
-                        } else {
-                            (Color::Muted, "In Queue")
-                        };
+            .children(self.message_queue.iter().enumerate().map(|(index, entry)| {
+                let entry_id = entry.id;
+                let editor = &entry.editor;
+                let is_next = index == 0;
+                let (icon_color, tooltip_text) = if is_next {
+                    (Color::Accent, "Next in Queue")
+                } else {
+                    (Color::Muted, "In Queue")
+                };
 
-                        let editor_focused = editor.focus_handle(cx).is_focused(_window);
-                        let keybinding_size = rems_from_px(12.);
+                let editor_focused = editor.focus_handle(cx).is_focused(_window);
+                let keybinding_size = rems_from_px(12_f32);
+                let steer_on = entry.steer;
 
+                let min_width = rems_from_px(160_f32);
+
+                h_flex()
+                    .group("queue_entry")
+                    .w_full()
+                    .p_1p5()
+                    .gap_1()
+                    .bg(cx.theme().colors().editor_background)
+                    .when(index < queue_len - 1, |this| {
+                        this.border_b_1()
+                            .border_color(cx.theme().colors().border_variant)
+                    })
+                    .child(
+                        div()
+                            .id("next_in_queue")
+                            .child(
+                                Icon::new(IconName::Circle)
+                                    .size(IconSize::Small)
+                                    .color(icon_color),
+                            )
+                            .tooltip(Tooltip::text(tooltip_text)),
+                    )
+                    .child(editor.clone())
+                    .child(if editor_focused {
                         h_flex()
-                            .group("queue_entry")
-                            .w_full()
-                            .p_1p5()
                             .gap_1()
-                            .bg(cx.theme().colors().editor_background)
-                            .when(index < queue_len - 1, |this| {
-                                this.border_b_1()
-                                    .border_color(cx.theme().colors().border_variant)
+                            .min_w(min_width)
+                            .justify_end()
+                            .child(
+                                IconButton::new(("edit", index), IconName::Pencil)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(|_window, cx| {
+                                        Tooltip::with_meta(
+                                            "Edit Queued Message",
+                                            None,
+                                            "Type anything to edit",
+                                            cx,
+                                        )
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.move_queued_message_to_main_editor(
+                                            entry_id, None, None, window, cx,
+                                        );
+                                    })),
+                            )
+                            .when(is_native, |row| {
+                                row.child(self.render_queue_steer_button(
+                                    entry_id, index, is_next, steer_on, cx,
+                                ))
                             })
                             .child(
-                                div()
-                                    .id("next_in_queue")
-                                    .child(
-                                        Icon::new(IconName::Circle)
-                                            .size(IconSize::Small)
-                                            .color(icon_color),
+                                Button::new(("send_now_focused", index), "Send Now")
+                                    .label_size(LabelSize::Small)
+                                    .style(ButtonStyle::Outlined)
+                                    .key_binding(
+                                        KeyBinding::for_action_in(
+                                            &SendImmediately,
+                                            &editor.focus_handle(cx),
+                                            cx,
+                                        )
+                                        .map(|kb| kb.size(keybinding_size)),
                                     )
-                                    .tooltip(Tooltip::text(tooltip_text)),
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.send_queued_message_now(entry_id, window, cx);
+                                    })),
                             )
-                            .child(editor.clone())
-                            .child(if editor_focused {
-                                h_flex()
-                                    .gap_1()
-                                    .min_w(rems_from_px(150.))
-                                    .justify_end()
-                                    .child(
-                                        IconButton::new(("edit", index), IconName::Pencil)
-                                            .icon_size(IconSize::Small)
-                                            .tooltip(|_window, cx| {
-                                                Tooltip::with_meta(
-                                                    "Edit Queued Message",
-                                                    None,
-                                                    "Type anything to edit",
+                    } else {
+                        h_flex()
+                            .when(!is_next, |this| this.visible_on_hover("queue_entry"))
+                            .gap_1()
+                            .min_w(min_width)
+                            .justify_end()
+                            .child(
+                                IconButton::new(("delete", index), IconName::Trash)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip({
+                                        let focus_handle = focus_handle.clone();
+                                        move |_window, cx| {
+                                            if is_next {
+                                                Tooltip::for_action_in(
+                                                    "Remove Message from Queue",
+                                                    &RemoveFirstQueuedMessage,
+                                                    &focus_handle,
                                                     cx,
                                                 )
-                                            })
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.move_queued_message_to_main_editor(
-                                                    index, None, window, cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new(("send_now_focused", index), "Send Now")
-                                            .label_size(LabelSize::Small)
-                                            .style(ButtonStyle::Outlined)
-                                            .key_binding(
-                                                KeyBinding::for_action_in(
-                                                    &SendImmediately,
-                                                    &editor.focus_handle(cx),
+                                            } else {
+                                                Tooltip::simple("Remove Message from Queue", cx)
+                                            }
+                                        }
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_from_queue(entry_id, cx);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                IconButton::new(("edit", index), IconName::Pencil)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip({
+                                        let focus_handle = focus_handle.clone();
+                                        move |_window, cx| {
+                                            if is_next {
+                                                Tooltip::for_action_in(
+                                                    "Edit",
+                                                    &EditFirstQueuedMessage,
+                                                    &focus_handle,
                                                     cx,
                                                 )
-                                                .map(|kb| kb.size(keybinding_size)),
-                                            )
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.send_queued_message_at_index(
-                                                    index, true, window, cx,
-                                                );
-                                            })),
-                                    )
-                            } else {
-                                h_flex()
-                                    .when(!is_next, |this| this.visible_on_hover("queue_entry"))
-                                    .gap_1()
-                                    .min_w(rems_from_px(150.))
-                                    .justify_end()
-                                    .child(
-                                        IconButton::new(("delete", index), IconName::Trash)
-                                            .icon_size(IconSize::Small)
-                                            .tooltip({
-                                                let focus_handle = focus_handle.clone();
-                                                move |_window, cx| {
-                                                    if is_next {
-                                                        Tooltip::for_action_in(
-                                                            "Remove Message from Queue",
-                                                            &RemoveFirstQueuedMessage,
-                                                            &focus_handle,
-                                                            cx,
-                                                        )
-                                                    } else {
-                                                        Tooltip::simple(
-                                                            "Remove Message from Queue",
-                                                            cx,
-                                                        )
-                                                    }
-                                                }
-                                            })
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.remove_from_queue(index, cx);
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        IconButton::new(("edit", index), IconName::Pencil)
-                                            .icon_size(IconSize::Small)
-                                            .tooltip({
-                                                let focus_handle = focus_handle.clone();
-                                                move |_window, cx| {
-                                                    if is_next {
-                                                        Tooltip::for_action_in(
-                                                            "Edit",
-                                                            &EditFirstQueuedMessage,
-                                                            &focus_handle,
-                                                            cx,
-                                                        )
-                                                    } else {
-                                                        Tooltip::simple("Edit", cx)
-                                                    }
-                                                }
-                                            })
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.move_queued_message_to_main_editor(
-                                                    index, None, window, cx,
-                                                );
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new(("send_now", index), "Send Now")
-                                            .label_size(LabelSize::Small)
-                                            .when(is_next, |this| this.style(ButtonStyle::Outlined))
-                                            .when(is_next && message_editor.is_empty(cx), |this| {
-                                                let action: Box<dyn gpui::Action> =
-                                                    if can_fast_track {
-                                                        Box::new(Chat)
-                                                    } else {
-                                                        Box::new(SendNextQueuedMessage)
-                                                    };
-
-                                                this.key_binding(
-                                                    KeyBinding::for_action_in(
-                                                        action.as_ref(),
-                                                        &focus_handle.clone(),
-                                                        cx,
-                                                    )
-                                                    .map(|kb| kb.size(keybinding_size)),
-                                                )
-                                            })
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.send_queued_message_at_index(
-                                                    index, true, window, cx,
-                                                );
-                                            })),
-                                    )
+                                            } else {
+                                                Tooltip::simple("Edit", cx)
+                                            }
+                                        }
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.move_queued_message_to_main_editor(
+                                            entry_id, None, None, window, cx,
+                                        );
+                                    })),
+                            )
+                            .when(is_native, |row| {
+                                row.child(self.render_queue_steer_button(
+                                    entry_id, index, is_next, steer_on, cx,
+                                ))
                             })
-                    }),
-            )
+                            .child(
+                                Button::new(("send_now", index), "Send Now")
+                                    .label_size(LabelSize::Small)
+                                    .when(is_next, |this| this.style(ButtonStyle::Outlined))
+                                    .when(is_next && message_editor.is_empty(cx), |this| {
+                                        let action: Box<dyn gpui::Action> = if can_fast_track {
+                                            Box::new(Chat)
+                                        } else {
+                                            Box::new(SendNextQueuedMessage)
+                                        };
+
+                                        this.key_binding(
+                                            KeyBinding::for_action_in(
+                                                action.as_ref(),
+                                                &focus_handle.clone(),
+                                                cx,
+                                            )
+                                            .map(|kb| kb.size(keybinding_size)),
+                                        )
+                                    })
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.send_queued_message_now(entry_id, window, cx);
+                                    })),
+                            )
+                    })
+            }))
             .into_any_element()
     }
 
@@ -3211,50 +5299,133 @@ impl ThreadView {
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let thread = self.thread.read(cx);
         let usage = thread.token_usage()?;
-        let is_generating = thread.status() != ThreadStatus::Idle;
         let show_split = self.supports_split_token_display(cx);
 
-        let separator_color = Color::Custom(cx.theme().colors().text_muted.opacity(0.5));
-        let token_label = |text: String, animation_id: &'static str| {
-            Label::new(text)
-                .size(LabelSize::Small)
-                .color(Color::Muted)
-                .map(|label| {
-                    if is_generating {
-                        label
-                            .with_animation(
-                                animation_id,
-                                Animation::new(Duration::from_secs(2))
-                                    .repeat()
-                                    .with_easing(pulsating_between(0.3, 0.8)),
-                                |label, delta| label.alpha(delta),
-                            )
-                            .into_any()
-                    } else {
-                        label.into_any_element()
-                    }
+        let cost_label = thread.cost().map(|cost| {
+            let precision = if cost.amount > 0.0 && cost.amount < 0.01 {
+                4
+            } else {
+                2
+            };
+            format!("{:.prec$} {}", cost.amount, cost.currency, prec = precision)
+        });
+
+        let progress_color = |ratio: f32| -> Hsla {
+            if ratio >= 0.85 {
+                cx.theme().status().warning
+            } else {
+                cx.theme().colors().text_muted
+            }
+        };
+
+        let used = crate::humanize_token_count(usage.used_tokens);
+        let max = crate::humanize_token_count(usage.max_tokens);
+        let input_tokens_label = crate::humanize_token_count(usage.input_tokens);
+        let output_tokens_label = crate::humanize_token_count(usage.output_tokens);
+
+        let progress_ratio = if usage.max_tokens > 0 {
+            usage.used_tokens as f32 / usage.max_tokens as f32
+        } else {
+            0.0
+        };
+
+        let ring_size = px(16.0);
+        let stroke_width = px(2.);
+
+        let percentage = format!("{}%", (progress_ratio * 100.0).round() as u32);
+
+        let tooltip_separator_color = Color::Custom(cx.theme().colors().text_disabled.opacity(0.6));
+
+        let (project_rules_count, project_entry_ids) = self
+            .as_native_thread(cx)
+            .map(|thread| {
+                let project_context = thread.read(cx).project_context().read(cx);
+                let project_entry_ids = project_context
+                    .worktrees
+                    .iter()
+                    .filter_map(|wt| wt.rules_file.as_ref())
+                    .map(|rf| ProjectEntryId::from_usize(rf.project_entry_id))
+                    .collect::<Vec<_>>();
+                let project_rules_count = project_entry_ids.len();
+                (project_rules_count, project_entry_ids)
+            })
+            .unwrap_or_default();
+
+        let global_agents_md_loaded = UserAgentsMd::global(cx)
+            .and_then(|md| md.content())
+            .is_some();
+
+        let workspace = self.workspace.clone();
+
+        let (max_input_tokens, max_output_tokens) = self
+            .as_native_thread(cx)
+            .map(|thread| {
+                let thread = thread.read(cx);
+                (
+                    thread.input_token_capacity().unwrap_or(usage.max_tokens),
+                    thread
+                        .model()
+                        .and_then(|model| model.max_output_tokens())
+                        .unwrap_or(0),
+                )
+            })
+            .unwrap_or((usage.max_tokens, 0));
+        let input_max_label = crate::humanize_token_count(max_input_tokens);
+        let output_max_label = crate::humanize_token_count(max_output_tokens);
+
+        let build_tooltip = {
+            move |_window: &mut Window, cx: &mut App| {
+                let percentage = percentage.clone();
+                let used = used.clone();
+                let max = max.clone();
+                let input_tokens_label = input_tokens_label.clone();
+                let output_tokens_label = output_tokens_label.clone();
+                let input_max_label = input_max_label.clone();
+                let output_max_label = output_max_label.clone();
+                let project_entry_ids = project_entry_ids.clone();
+                let workspace = workspace.clone();
+                let cost_label = cost_label.clone();
+                cx.new(move |_cx| TokenUsageTooltip {
+                    percentage,
+                    used,
+                    max,
+                    input_tokens: input_tokens_label,
+                    output_tokens: output_tokens_label,
+                    input_max: input_max_label,
+                    output_max: output_max_label,
+                    show_split,
+                    cost_label,
+                    separator_color: tooltip_separator_color,
+                    global_agents_md_loaded,
+                    project_rules_count,
+                    project_entry_ids,
+                    workspace,
                 })
+                .into()
+            }
         };
 
         if show_split {
-            let max_output_tokens = self
-                .as_native_thread(cx)
-                .and_then(|thread| thread.read(cx).model())
-                .and_then(|model| model.max_output_tokens())
-                .unwrap_or(0);
+            let input_max_raw = max_input_tokens;
+            let output_max_raw = max_output_tokens;
 
-            let input = crate::text_thread_editor::humanize_token_count(usage.input_tokens);
-            let input_max = crate::text_thread_editor::humanize_token_count(
-                usage.max_tokens.saturating_sub(max_output_tokens),
-            );
-            let output = crate::text_thread_editor::humanize_token_count(usage.output_tokens);
-            let output_max = crate::text_thread_editor::humanize_token_count(max_output_tokens);
+            let input_ratio = if input_max_raw > 0 {
+                usage.input_tokens as f32 / input_max_raw as f32
+            } else {
+                0.0
+            };
+            let output_ratio = if output_max_raw > 0 {
+                usage.output_tokens as f32 / output_max_raw as f32
+            } else {
+                0.0
+            };
 
             Some(
                 h_flex()
+                    .id("split_token_usage")
                     .flex_shrink_0()
-                    .gap_1()
-                    .mr_1p5()
+                    .gap_1p5()
+                    .mr_1()
                     .child(
                         h_flex()
                             .gap_0p5()
@@ -3263,16 +5434,15 @@ impl ThreadView {
                                     .size(IconSize::XSmall)
                                     .color(Color::Muted),
                             )
-                            .child(token_label(input, "input-tokens-label"))
                             .child(
-                                Label::new("/")
-                                    .size(LabelSize::Small)
-                                    .color(separator_color),
-                            )
-                            .child(
-                                Label::new(input_max)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
+                                CircularProgress::new(
+                                    usage.input_tokens as f32,
+                                    input_max_raw as f32,
+                                    ring_size,
+                                    cx,
+                                )
+                                .stroke_width(stroke_width)
+                                .progress_color(progress_color(input_ratio)),
                             ),
                     )
                     .child(
@@ -3283,52 +5453,21 @@ impl ThreadView {
                                     .size(IconSize::XSmall)
                                     .color(Color::Muted),
                             )
-                            .child(token_label(output, "output-tokens-label"))
                             .child(
-                                Label::new("/")
-                                    .size(LabelSize::Small)
-                                    .color(separator_color),
-                            )
-                            .child(
-                                Label::new(output_max)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
+                                CircularProgress::new(
+                                    usage.output_tokens as f32,
+                                    output_max_raw as f32,
+                                    ring_size,
+                                    cx,
+                                )
+                                .stroke_width(stroke_width)
+                                .progress_color(progress_color(output_ratio)),
                             ),
                     )
+                    .hoverable_tooltip(build_tooltip)
                     .into_any_element(),
             )
         } else {
-            let used = crate::text_thread_editor::humanize_token_count(usage.used_tokens);
-            let max = crate::text_thread_editor::humanize_token_count(usage.max_tokens);
-            let progress_ratio = if usage.max_tokens > 0 {
-                usage.used_tokens as f32 / usage.max_tokens as f32
-            } else {
-                0.0
-            };
-
-            let progress_color = if progress_ratio >= 0.85 {
-                cx.theme().status().warning
-            } else {
-                cx.theme().colors().text_muted
-            };
-            let separator_color = Color::Custom(cx.theme().colors().text_disabled.opacity(0.6));
-
-            let percentage = format!("{}%", (progress_ratio * 100.0).round() as u32);
-
-            let (user_rules_count, project_rules_count) = self
-                .as_native_thread(cx)
-                .map(|thread| {
-                    let project_context = thread.read(cx).project_context().read(cx);
-                    let user_rules = project_context.user_rules.len();
-                    let project_rules = project_context
-                        .worktrees
-                        .iter()
-                        .filter(|wt| wt.rules_file.is_some())
-                        .count();
-                    (user_rules, project_rules)
-                })
-                .unwrap_or((0, 0));
-
             Some(
                 h_flex()
                     .id("circular_progress_tokens")
@@ -3338,72 +5477,136 @@ impl ThreadView {
                         CircularProgress::new(
                             usage.used_tokens as f32,
                             usage.max_tokens as f32,
-                            px(16.0),
+                            ring_size,
                             cx,
                         )
-                        .stroke_width(px(2.))
-                        .progress_color(progress_color),
+                        .stroke_width(stroke_width)
+                        .progress_color(progress_color(progress_ratio)),
                     )
-                    .tooltip(Tooltip::element({
-                        move |_, cx| {
-                            v_flex()
-                                .min_w_40()
-                                .child(
-                                    Label::new("Context")
-                                        .color(Color::Muted)
-                                        .size(LabelSize::Small),
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_0p5()
-                                        .child(Label::new(percentage.clone()))
-                                        .child(Label::new("•").color(separator_color).mx_1())
-                                        .child(Label::new(used.clone()))
-                                        .child(Label::new("/").color(separator_color))
-                                        .child(Label::new(max.clone()).color(Color::Muted)),
-                                )
-                                .when(user_rules_count > 0 || project_rules_count > 0, |this| {
-                                    this.child(
-                                        v_flex()
-                                            .mt_1p5()
-                                            .pt_1p5()
-                                            .border_t_1()
-                                            .border_color(cx.theme().colors().border_variant)
-                                            .child(
-                                                Label::new("Rules")
-                                                    .color(Color::Muted)
-                                                    .size(LabelSize::Small),
-                                            )
-                                            .when(user_rules_count > 0, |this| {
-                                                this.child(Label::new(format!(
-                                                    "{} user rules",
-                                                    user_rules_count
-                                                )))
-                                            })
-                                            .when(project_rules_count > 0, |this| {
-                                                this.child(Label::new(format!(
-                                                    "{} project rules",
-                                                    project_rules_count
-                                                )))
-                                            }),
-                                    )
-                                })
-                                .into_any_element()
-                        }
-                    }))
+                    .hoverable_tooltip(build_tooltip)
                     .into_any_element(),
             )
         }
     }
 
     fn fast_mode_available(&self, cx: &Context<Self>) -> bool {
-        if !cx.is_staff() {
-            return false;
-        }
         self.as_native_thread(cx)
             .and_then(|thread| thread.read(cx).model())
             .map(|model| model.supports_fast_mode())
             .unwrap_or(false)
+    }
+
+    fn refresh_sandbox_status(&mut self, cx: &mut Context<Self>) -> Option<VerifiedSandboxStatus> {
+        let thread = self.as_native_thread(cx)?;
+        let (key, refresh) =
+            thread.update(cx, |thread, cx| thread.refresh_verified_sandbox_status(cx))?;
+
+        if self.sandbox_status_key.as_ref() == Some(&key) {
+            return self.sandbox_status.clone();
+        }
+
+        match refresh {
+            SandboxStatusRefresh::Ready(status) => {
+                self.sandbox_status = Some(status.clone());
+                self.sandbox_status_key = Some(key);
+                self.pending_sandbox_status_key = None;
+                Some(status)
+            }
+            SandboxStatusRefresh::Pending(task) => {
+                if self.pending_sandbox_status_key.as_ref() != Some(&key) {
+                    self.sandbox_status = None;
+                    self.sandbox_status_key = None;
+                    self.pending_sandbox_status_key = Some(key.clone());
+                    self._sandbox_status_refresh_task = Some(cx.spawn(async move |this, cx| {
+                        let status = task.await;
+                        this.update(cx, |this, cx| {
+                            if this.pending_sandbox_status_key.as_ref() == Some(&key) {
+                                this.sandbox_status = Some(status);
+                                this.sandbox_status_key = Some(key);
+                                this.pending_sandbox_status_key = None;
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    }));
+                }
+                None
+            }
+        }
+    }
+
+    pub fn render_sandbox_status(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let status = self.refresh_sandbox_status(cx)?;
+        let settings_sandbox = status.settings_sandbox.clone();
+        let thread_sandbox = status.thread_sandbox.clone();
+        let baseline = status.baseline_writable_paths;
+
+        // The lock is struck only when the *merged* result is unsandboxed (the
+        // agent runs with ambient permissions). A layer that is merely wide open
+        // but still sandboxed keeps the closed lock.
+        let (icon, icon_color) = if settings_sandbox
+            .clone()
+            .merge(thread_sandbox.clone())
+            .is_unsandboxed()
+        {
+            (IconName::LockOff, Color::Muted)
+        } else {
+            (IconName::Lock, Color::Default)
+        };
+
+        let tooltip = match (settings_sandbox, thread_sandbox) {
+            // No sandbox at all because the user turned it off in settings: the
+            // per-thread layer is moot, so don't show it.
+            (ThreadSandbox::Unsandboxed, _) => SandboxStatusTooltip::disabled_in_settings(),
+            // Sandboxed by settings, but disabled for this thread: show the
+            // settings scope (greyed) for context above the disabled status.
+            (ThreadSandbox::Sandboxed(settings_policy), ThreadSandbox::Unsandboxed) => {
+                let settings = augment_settings_sandbox_policy(&settings_policy, baseline);
+                SandboxStatusTooltip::disabled_for_thread(sandbox_section(
+                    "Defined in your settings:",
+                    &settings,
+                    true,
+                ))
+            }
+            (
+                ThreadSandbox::Sandboxed(settings_policy),
+                ThreadSandbox::Sandboxed(thread_policy),
+            ) => {
+                let settings = augment_settings_sandbox_policy(&settings_policy, baseline);
+                let thread = SandboxPolicyDisplay::from_policy(&thread_policy);
+                // Omit the per-thread section when it grants nothing extra.
+                let thread = (!sandbox_policy_grants_nothing(&thread))
+                    .then(|| sandbox_section("Allowed for this thread:", &thread, false));
+                SandboxStatusTooltip::enabled(
+                    sandbox_section("Defined in your settings:", &settings, true),
+                    thread,
+                )
+            }
+        };
+
+        Some(
+            h_flex()
+                .gap_1()
+                .child(
+                    IconButton::new("sandbox-status", icon)
+                        .icon_size(IconSize::Small)
+                        .icon_color(icon_color)
+                        .tooltip(Tooltip::element(move |_window, _cx| {
+                            tooltip.clone().into_any_element()
+                        }))
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(
+                                Box::new(zed_actions::OpenSettingsAt {
+                                    path: zed_actions::AGENT_SANDBOX_SETTINGS_PATH.to_string(),
+                                    target: None,
+                                }),
+                                cx,
+                            );
+                        }),
+                )
+                .child(Divider::vertical())
+                .into_any_element(),
+        )
     }
 
     fn render_fast_mode_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3412,31 +5615,137 @@ impl ThreadView {
         }
 
         let thread = self.as_native_thread(cx)?.read(cx);
+        let is_fast = matches!(thread.speed(), Some(Speed::Fast));
 
-        let (tooltip_label, color, icon) = if matches!(thread.speed(), Some(Speed::Fast)) {
-            ("Disable Fast Mode", Color::Muted, IconName::FastForward)
+        let model_identity = thread
+            .model()
+            .map(|model| (model.provider_id(), model.id()));
+
+        let (tooltip_label, color, icon, new_speed) = if is_fast {
+            (
+                "Disable Fast Mode",
+                Color::Accent,
+                IconName::FastForward,
+                Speed::Standard,
+            )
         } else {
             (
                 "Enable Fast Mode",
                 Color::Custom(cx.theme().colors().icon_disabled.opacity(0.8)),
                 IconName::FastForwardOff,
+                Speed::Fast,
             )
         };
 
         let focus_handle = self.message_editor.focus_handle(cx);
 
+        let pending_confirmation = (!is_fast)
+            .then(|| self.pending_fast_mode_confirmation(cx))
+            .flatten();
+
+        let icon_button = IconButton::new("fast-mode", icon)
+            .icon_size(IconSize::Small)
+            .icon_color(color);
+
+        if let Some((provider_id, model_id, confirmation)) = pending_confirmation {
+            let weak_self = cx.entity().downgrade();
+            let tooltip_focus = focus_handle;
+
+            return Some(
+                PopoverMenu::new("fast-mode-warning")
+                    .with_handle(self.fast_mode_menu_handle.clone())
+                    .trigger_with_tooltip(icon_button, move |_, cx| {
+                        Tooltip::for_action_in(tooltip_label, &ToggleFastMode, &tooltip_focus, cx)
+                    })
+                    .menu(move |window, cx| {
+                        let weak_self = weak_self.clone();
+                        let confirmation = confirmation.clone();
+                        let provider_id = provider_id.clone();
+                        let model_id = model_id.clone();
+
+                        Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
+                            let message = confirmation.message.clone();
+                            menu.custom_row(move |_window, _cx| {
+                                div()
+                                    .max_w_72()
+                                    .child(Label::new(confirmation.title.clone()))
+                                    .child(Label::new(message.clone()).color(Color::Muted))
+                                    .into_any_element()
+                            })
+                            .separator()
+                            .item(ContextMenuEntry::new("Enable Now").handler({
+                                let weak_self = weak_self.clone();
+                                move |_window, cx| {
+                                    weak_self
+                                        .update(cx, |this, cx| {
+                                            this.apply_fast_mode_speed(Speed::Fast, cx);
+                                        })
+                                        .log_err();
+                                }
+                            }))
+                            .item(
+                                ContextMenuEntry::new("Enable and Don't Show Again").handler({
+                                    let weak_self = weak_self.clone();
+                                    let provider_id = provider_id.clone();
+                                    let model_id = model_id;
+                                    move |_window, cx| {
+                                        weak_self
+                                            .update(cx, |this, cx| {
+                                                this.apply_fast_mode_speed(Speed::Fast, cx);
+                                            })
+                                            .log_err();
+                                        set_fast_mode_warning_dismissed(
+                                            &provider_id,
+                                            &model_id,
+                                            cx,
+                                        );
+                                    }
+                                }),
+                            )
+                        }))
+                    })
+                    .offset(gpui::Point {
+                        x: px(0.0),
+                        y: px(-2.0),
+                    })
+                    .anchor(gpui::Anchor::BottomLeft)
+                    .into_any_element(),
+            );
+        }
+
+        let _ = model_identity;
+
         Some(
-            IconButton::new("fast-mode", icon)
-                .icon_size(IconSize::Small)
-                .icon_color(color)
+            icon_button
                 .tooltip(move |_, cx| {
                     Tooltip::for_action_in(tooltip_label, &ToggleFastMode, &focus_handle, cx)
                 })
                 .on_click(cx.listener(move |this, _, _window, cx| {
-                    this.toggle_fast_mode(cx);
+                    this.apply_fast_mode_speed(new_speed, cx);
                 }))
                 .into_any_element(),
         )
+    }
+
+    fn pending_fast_mode_confirmation(
+        &self,
+        cx: &App,
+    ) -> Option<(
+        LanguageModelProviderId,
+        LanguageModelId,
+        FastModeConfirmation,
+    )> {
+        let thread = self.as_native_thread(cx)?.read(cx);
+        let model = thread.model()?;
+        let provider_id = model.provider_id();
+        let model_id = model.id();
+        let confirmation = LanguageModelRegistry::read_global(cx)
+            .provider(&provider_id)
+            .and_then(|provider| provider.fast_mode_confirmation(cx))?;
+        if fast_mode_warning_dismissed(&provider_id, &model_id, cx) {
+            return None;
+        }
+        Some((provider_id, model_id, confirmation))
     }
 
     fn render_thinking_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3448,13 +5757,31 @@ impl ThreadView {
             return None;
         }
 
+        // A toggle would be dishonest for models that always think: only
+        // offer the effort selector.
+        if !model.supports_disabling_thinking() {
+            let effort_levels = model.supported_effort_levels();
+            if effort_levels.is_empty() {
+                return None;
+            }
+            return Some(
+                self.render_effort_selector(
+                    effort_levels,
+                    thread.thinking_effort().cloned(),
+                    true,
+                    cx,
+                )
+                .into_any_element(),
+            );
+        }
+
         let thinking = thread.thinking_enabled();
 
         let (tooltip_label, icon, color) = if thinking {
             (
                 "Disable Thinking Mode",
                 IconName::ThinkingMode,
-                Color::Muted,
+                Color::Accent,
             )
         } else {
             (
@@ -3478,12 +5805,22 @@ impl ThreadView {
                         let enable_thinking = !thread.thinking_enabled();
                         thread.set_thinking_enabled(enable_thinking, cx);
 
+                        let favorite_key = thread
+                            .model()
+                            .map(|model| (model.provider_id.0.to_string(), model.id.0.to_string()));
                         let fs = thread.project().read(cx).fs().clone();
                         update_settings_file(fs, cx, move |settings, _| {
-                            if let Some(agent) = settings.agent.as_mut()
-                                && let Some(default_model) = agent.default_model.as_mut()
-                            {
-                                default_model.enable_thinking = enable_thinking;
+                            if let Some(agent) = settings.agent.as_mut() {
+                                if let Some(default_model) = agent.default_model.as_mut() {
+                                    default_model.enable_thinking = enable_thinking;
+                                }
+                                if let Some((provider_id, model_id)) = &favorite_key {
+                                    agent.update_favorite_model(
+                                        provider_id,
+                                        model_id,
+                                        |favorite| favorite.enable_thinking = enable_thinking,
+                                    );
+                                }
                             }
                         });
                     });
@@ -3502,6 +5839,7 @@ impl ThreadView {
         let right_btn = self.render_effort_selector(
             model.supported_effort_levels(),
             thread.thinking_effort().cloned(),
+            false,
             cx,
         );
 
@@ -3516,6 +5854,7 @@ impl ThreadView {
         &self,
         supported_effort_levels: Vec<LanguageModelEffortLevel>,
         selected_effort: Option<String>,
+        standalone: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let weak_self = cx.weak_entity();
@@ -3581,12 +5920,27 @@ impl ThreadView {
             }
         });
 
-        PopoverMenu::new("effort-selector")
-            .trigger_with_tooltip(
-                ButtonLike::new_rounded_right("effort-selector-trigger")
-                    .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+        let trigger = if standalone {
+            ButtonLike::new("effort-selector-trigger").child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Icon::new(IconName::ThinkingMode)
+                            .size(IconSize::Small)
+                            .color(Color::Accent),
+                    )
                     .child(Label::new(label).size(LabelSize::Small).color(label_color))
                     .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
+            )
+        } else {
+            ButtonLike::new_rounded_right("effort-selector-trigger")
+                .child(Label::new(label).size(LabelSize::Small).color(label_color))
+                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
+        };
+
+        PopoverMenu::new("effort-selector")
+            .trigger_with_tooltip(
+                trigger.selected_style(ButtonStyle::Tinted(TintColor::Accent)),
                 tooltip,
             )
             .menu(move |window, cx| {
@@ -3614,14 +5968,33 @@ impl ThreadView {
                                                     cx,
                                                 );
 
+                                                let favorite_key = thread.model().map(|model| {
+                                                    (
+                                                        model.provider_id().0.to_string(),
+                                                        model.id().0.to_string(),
+                                                    )
+                                                });
                                                 let fs = thread.project().read(cx).fs().clone();
                                                 update_settings_file(fs, cx, move |settings, _| {
-                                                    if let Some(agent) = settings.agent.as_mut()
-                                                        && let Some(default_model) =
+                                                    if let Some(agent) = settings.agent.as_mut() {
+                                                        if let Some(default_model) =
                                                             agent.default_model.as_mut()
-                                                    {
-                                                        default_model.effort =
-                                                            Some(effort.to_string());
+                                                        {
+                                                            default_model.effort =
+                                                                Some(effort.to_string());
+                                                        }
+                                                        if let Some((provider_id, model_id)) =
+                                                            &favorite_key
+                                                        {
+                                                            agent.update_favorite_model(
+                                                                provider_id,
+                                                                model_id,
+                                                                |favorite| {
+                                                                    favorite.effort =
+                                                                        Some(effort.to_string())
+                                                                },
+                                                            );
+                                                        }
                                                     }
                                                 });
                                             });
@@ -3640,7 +6013,7 @@ impl ThreadView {
                 x: px(0.0),
                 y: px(-2.0),
             })
-            .anchor(Corner::BottomLeft)
+            .anchor(gpui::Anchor::BottomLeft)
     }
 
     fn render_send_button(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3744,7 +6117,7 @@ impl ThreadView {
                     }
                 },
             )
-            .anchor(Corner::BottomLeft)
+            .anchor(gpui::Anchor::BottomLeft)
             .with_handle(self.add_context_menu_handle.clone())
             .offset(gpui::Point {
                 x: px(0.0),
@@ -3767,6 +6140,8 @@ impl ThreadView {
         let session_capabilities = self.session_capabilities.read();
         let supports_images = session_capabilities.supports_images();
         let supports_embedded_context = session_capabilities.supports_embedded_context();
+        let available_skills = session_capabilities.completion_skills();
+        drop(session_capabilities);
 
         let has_editor_selection = workspace
             .upgrade()
@@ -3790,7 +6165,6 @@ impl ThreadView {
 
         ContextMenu::build(window, cx, move |menu, _window, _cx| {
             menu.key_context("AddContextMenu")
-                .header("Context")
                 .item(
                     ContextMenuEntry::new("Files & Directories")
                         .icon(IconName::File)
@@ -3836,21 +6210,19 @@ impl ThreadView {
                             }
                         }),
                 )
-                .item(
-                    ContextMenuEntry::new("Rules")
-                        .icon(IconName::Reader)
-                        .icon_color(Color::Muted)
-                        .icon_size(IconSize::XSmall)
-                        .handler({
-                            let message_editor = message_editor.clone();
-                            move |window, cx| {
-                                message_editor.focus_handle(cx).focus(window, cx);
-                                message_editor.update(cx, |editor, cx| {
-                                    editor.insert_context_type("rule", window, cx);
-                                });
+                .when(!available_skills.is_empty(), |this| {
+                    this.submenu_with_colored_icon("Skills", IconName::Sparkle, Color::Muted, {
+                        let message_editor = message_editor.clone();
+                        let available_skills = available_skills.clone();
+                        move |mut menu, _window, _cx| {
+                            for skill in &available_skills {
+                                menu = menu
+                                    .item(Self::skill_menu_entry(skill, message_editor.clone()));
                             }
-                        }),
-                )
+                            menu
+                        }
+                    })
+                })
                 .item(
                     ContextMenuEntry::new("Image")
                         .icon(IconName::Image)
@@ -3899,6 +6271,25 @@ impl ThreadView {
         })
     }
 
+    fn skill_menu_entry(
+        skill: &AvailableSkill,
+        message_editor: Entity<crate::message_editor::MessageEditor>,
+    ) -> ContextMenuEntry {
+        let label = format!("{} ({})", skill.name, skill.source);
+        let skill = skill.clone();
+
+        ContextMenuEntry::new(label)
+            .icon(IconName::Sparkle)
+            .icon_color(Color::Muted)
+            .icon_size(IconSize::XSmall)
+            .handler(move |window, cx| {
+                message_editor.focus_handle(cx).focus(window, cx);
+                message_editor.update(cx, |editor, cx| {
+                    editor.insert_skill_crease(&skill, window, cx);
+                });
+            })
+    }
+
     fn render_follow_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let following = self.is_following(cx);
 
@@ -3939,20 +6330,412 @@ impl ThreadView {
     }
 }
 
+struct TokenUsageTooltip {
+    percentage: String,
+    used: String,
+    max: String,
+    input_tokens: String,
+    output_tokens: String,
+    input_max: String,
+    output_max: String,
+    show_split: bool,
+    cost_label: Option<String>,
+    separator_color: Color,
+    global_agents_md_loaded: bool,
+    project_rules_count: usize,
+    project_entry_ids: Vec<ProjectEntryId>,
+    workspace: WeakEntity<Workspace>,
+}
+
+impl Render for TokenUsageTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let separator_color = self.separator_color;
+        let percentage = self.percentage.clone();
+        let used = self.used.clone();
+        let max = self.max.clone();
+        let input_tokens = self.input_tokens.clone();
+        let output_tokens = self.output_tokens.clone();
+        let input_max = self.input_max.clone();
+        let output_max = self.output_max.clone();
+        let show_split = self.show_split;
+        let cost_label = self.cost_label.clone();
+        let global_agents_md_loaded = self.global_agents_md_loaded;
+        let project_rules_count = self.project_rules_count;
+        let project_entry_ids = self.project_entry_ids.clone();
+        let workspace = self.workspace.clone();
+
+        ui::tooltip_container(cx, move |container, cx| {
+            container
+                .min_w_40()
+                .child(
+                    Label::new("Context")
+                        .color(Color::Muted)
+                        .size(LabelSize::Small),
+                )
+                .when(!show_split, |this| {
+                    this.child(
+                        h_flex()
+                            .gap_0p5()
+                            .child(Label::new(percentage.clone()))
+                            .child(Label::new("\u{2022}").color(separator_color).mx_1())
+                            .child(Label::new(used.clone()))
+                            .child(Label::new("/").color(separator_color))
+                            .child(Label::new(max.clone()).color(Color::Muted)),
+                    )
+                })
+                .when(show_split, |this| {
+                    this.child(
+                        v_flex()
+                            .gap_0p5()
+                            .child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .child(Label::new("Input:").color(Color::Muted).mr_0p5())
+                                    .child(Label::new(input_tokens))
+                                    .child(Label::new("/").color(separator_color))
+                                    .child(Label::new(input_max).color(Color::Muted)),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_0p5()
+                                    .child(Label::new("Output:").color(Color::Muted).mr_0p5())
+                                    .child(Label::new(output_tokens))
+                                    .child(Label::new("/").color(separator_color))
+                                    .child(Label::new(output_max).color(Color::Muted)),
+                            ),
+                    )
+                })
+                .when_some(cost_label, |this, cost_label| {
+                    this.child(
+                        v_flex()
+                            .mt_1p5()
+                            .pt_1p5()
+                            .gap_0p5()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(
+                                Label::new("Cost")
+                                    .color(Color::Muted)
+                                    .size(LabelSize::Small),
+                            )
+                            .child(Label::new(cost_label)),
+                    )
+                })
+                .when(
+                    global_agents_md_loaded || project_rules_count > 0,
+                    move |this| {
+                        this.child(
+                            v_flex()
+                                .mt_1p5()
+                                .pt_1p5()
+                                .pb_0p5()
+                                .gap_0p5()
+                                .border_t_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .child(
+                                    Label::new("Rules")
+                                        .color(Color::Muted)
+                                        .size(LabelSize::Small),
+                                )
+                                .child(
+                                    v_flex()
+                                        .mx_neg_1()
+                                        .when(global_agents_md_loaded, {
+                                            let workspace = workspace.clone();
+                                            move |this| {
+                                                this.child(
+                                                    Button::new(
+                                                        "open-global-agents-md",
+                                                        "1 global rule",
+                                                    )
+                                                    .end_icon(
+                                                        Icon::new(IconName::ArrowUpRight)
+                                                            .color(Color::Muted)
+                                                            .size(IconSize::XSmall),
+                                                    )
+                                                    .on_click(move |_, window, cx| {
+                                                        workspace
+                                                            .update(cx, |workspace, cx| {
+                                                                workspace
+                                                                    .open_abs_path(
+                                                                        paths::agents_file()
+                                                                            .clone(),
+                                                                        workspace::OpenOptions {
+                                                                            focus: Some(true),
+                                                                            ..Default::default()
+                                                                        },
+                                                                        window,
+                                                                        cx,
+                                                                    )
+                                                                    .detach_and_log_err(cx);
+                                                            })
+                                                            .log_err();
+                                                    }),
+                                                )
+                                            }
+                                        })
+                                        .when(project_rules_count > 0, move |this| {
+                                            let workspace = workspace.clone();
+                                            let project_entry_ids = project_entry_ids.clone();
+                                            this.child(
+                                                Button::new(
+                                                    "open-project-rules",
+                                                    format!(
+                                                        "{} {}",
+                                                        project_rules_count,
+                                                        pluralize(
+                                                            "project rule",
+                                                            project_rules_count
+                                                        )
+                                                    ),
+                                                )
+                                                .end_icon(
+                                                    Icon::new(IconName::ArrowUpRight)
+                                                        .color(Color::Muted)
+                                                        .size(IconSize::XSmall),
+                                                )
+                                                .on_click(move |_, window, cx| {
+                                                    let _ =
+                                                        workspace.update(cx, |workspace, cx| {
+                                                            let project =
+                                                                workspace.project().read(cx);
+                                                            let paths = project_entry_ids
+                                                                .iter()
+                                                                .flat_map(|id| {
+                                                                    project.path_for_entry(*id, cx)
+                                                                })
+                                                                .collect::<Vec<_>>();
+                                                            for path in paths {
+                                                                workspace
+                                                                    .open_path(
+                                                                        path, None, true, window,
+                                                                        cx,
+                                                                    )
+                                                                    .detach_and_log_err(cx);
+                                                            }
+                                                        });
+                                                }),
+                                            )
+                                        }),
+                                ),
+                        )
+                    },
+                )
+        })
+    }
+}
+
+/// A display-ready snapshot of a sandbox policy for the status tooltip.
+///
+/// The opaque `HostFilesystemLocation`s in a policy are stringified up front,
+/// when this is built, so the tooltip state (which outlives the build and is
+/// captured by the lazy tooltip closure) never holds the locations' fds open.
+#[derive(Clone)]
+struct SandboxPolicyDisplay {
+    fs: SandboxFsDisplay,
+    network: SandboxNetPolicy,
+}
+
+/// The filesystem write-access portion of a [`SandboxPolicyDisplay`].
+#[derive(Clone)]
+enum SandboxFsDisplay {
+    Unrestricted,
+    Restricted(Vec<WritableEntryDisplay>),
+}
+
+/// A single writable entry to display in the sandbox tooltip: either a real host
+/// location (already stringified for display) or the Linux-only host-isolated
+/// `/tmp` overlay, which has no backing host path and is purely a label.
+#[derive(Clone)]
+enum WritableEntryDisplay {
+    Path(String),
+    // Only ever constructed on Linux (the bwrap `--tmpfs /tmp` overlay), so the
+    // variant is gated to match and avoid dead-code warnings elsewhere.
+    #[cfg(target_os = "linux")]
+    IsolatedTmp,
+}
+
+impl SandboxPolicyDisplay {
+    /// Display a policy verbatim (used for the per-thread overrides, which carry
+    /// no implicit baseline grants). Takes the policy by reference and stringifies
+    /// its locations immediately, so no fd is retained past this call.
+    fn from_policy(policy: &SandboxPolicy) -> Self {
+        let fs = match &policy.fs {
+            SandboxFsPolicy::Unrestricted { .. } => SandboxFsDisplay::Unrestricted,
+            SandboxFsPolicy::Restricted { writable_paths, .. } => SandboxFsDisplay::Restricted(
+                writable_paths
+                    .iter()
+                    .map(|location| {
+                        WritableEntryDisplay::Path(location.untrusted_path_display().to_string())
+                    })
+                    .collect(),
+            ),
+        };
+        SandboxPolicyDisplay {
+            fs,
+            network: policy.network.clone(),
+        }
+    }
+}
+
+/// Fold the always-granted baseline writable paths (the project's worktree
+/// roots, derived from the same source the terminal tool uses) and, on Linux,
+/// the host-isolated `/tmp` overlay into a settings policy for display. These
+/// are part of what the sandbox grants whenever it's active but aren't
+/// persistent-settings entries, so they're shown in the "from your settings"
+/// section rather than stored. A no-op when the fs is unrestricted (rendered as
+/// "All paths"), since there's nothing to scope.
+fn augment_settings_sandbox_policy(
+    policy: &SandboxPolicy,
+    baseline: Vec<PathBuf>,
+) -> SandboxPolicyDisplay {
+    let fs = match &policy.fs {
+        SandboxFsPolicy::Unrestricted { .. } => SandboxFsDisplay::Unrestricted,
+        SandboxFsPolicy::Restricted { writable_paths, .. } => {
+            // Dedup by display string. We deliberately don't open the locations'
+            // fds to dedup by inode here: this is a display-only tooltip and the
+            // string is the location's identity for that purpose. The string can
+            // only diverge from the captured inode while a symlink-swap is
+            // actively in progress, and in that case the bind validator refuses
+            // to run the command at all (see the `sandbox` crate) — so showing the
+            // requested path is always safe, and not worth a blocking syscall on
+            // the render path.
+            let mut merged: Vec<String> = Vec::new();
+            let baseline_paths = baseline.iter().map(|path| path.display().to_string());
+            let granted_paths = writable_paths
+                .iter()
+                .map(|location| location.untrusted_path_display().to_string());
+            for path in baseline_paths.chain(granted_paths) {
+                if !merged.contains(&path) {
+                    merged.push(path);
+                }
+            }
+            // `mut` is only needed on Linux, where the isolated `/tmp` entry is
+            // pushed below.
+            #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+            let mut entries: Vec<WritableEntryDisplay> =
+                merged.into_iter().map(WritableEntryDisplay::Path).collect();
+            // The ephemeral, host-isolated tmpfs at /tmp is Linux-specific (the
+            // bwrap `--tmpfs /tmp` overlay). It's a display-only label, not a
+            // real host path, so it can't be a captured location.
+            #[cfg(target_os = "linux")]
+            entries.push(WritableEntryDisplay::IsolatedTmp);
+            SandboxFsDisplay::Restricted(entries)
+        }
+    };
+    SandboxPolicyDisplay {
+        fs,
+        network: policy.network.clone(),
+    }
+}
+
+fn sandbox_section(title: &str, policy: &SandboxPolicyDisplay, show_empty: bool) -> SandboxSection {
+    let write_empty = fs_grants_nothing(&policy.fs);
+    let network_empty = network_grants_nothing(&policy.network);
+    let mut section = SandboxSection::new(title.to_string());
+
+    if show_empty || !write_empty {
+        section =
+            section.group(SandboxGroup::new("Write Access").rows(sandbox_fs_rows(&policy.fs)));
+    }
+
+    if show_empty || !network_empty {
+        section = section
+            .group(SandboxGroup::new("Network Access").rows(sandbox_network_rows(&policy.network)));
+    }
+
+    section
+}
+
+/// Whether a policy grants nothing worth surfacing, used to decide whether to
+/// show the per-thread overrides section at all.
+fn sandbox_policy_grants_nothing(policy: &SandboxPolicyDisplay) -> bool {
+    fs_grants_nothing(&policy.fs) && network_grants_nothing(&policy.network)
+}
+
+fn fs_grants_nothing(fs: &SandboxFsDisplay) -> bool {
+    matches!(fs, SandboxFsDisplay::Restricted(entries) if entries.is_empty())
+}
+
+fn network_grants_nothing(network: &SandboxNetPolicy) -> bool {
+    match network {
+        SandboxNetPolicy::Blocked => true,
+        SandboxNetPolicy::Restricted { allowed_domains } => allowed_domains.is_empty(),
+        SandboxNetPolicy::Unrestricted => false,
+    }
+}
+
+/// Rows for the write-access group: a message for the "all"/"none" cases, or one
+/// row per granted path.
+fn sandbox_fs_rows(fs: &SandboxFsDisplay) -> Vec<SandboxRow> {
+    match fs {
+        SandboxFsDisplay::Unrestricted => vec![SandboxRow::message(
+            "All paths except protected Git metadata",
+        )],
+        SandboxFsDisplay::Restricted(entries) if entries.is_empty() => {
+            vec![SandboxRow::message("None")]
+        }
+        SandboxFsDisplay::Restricted(entries) => entries
+            .iter()
+            .map(|entry| match entry {
+                // The display string was captured up front.
+                WritableEntryDisplay::Path(path) => SandboxRow::path(PathBuf::from(path)),
+                #[cfg(target_os = "linux")]
+                WritableEntryDisplay::IsolatedTmp => {
+                    SandboxRow::path(PathBuf::from("/tmp (isolated)"))
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Rows for the network-access group: a message for the "all"/"none" cases, or
+/// one row per allowed domain.
+fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
+    match network {
+        SandboxNetPolicy::Unrestricted => vec![SandboxRow::message("All domains (unrestricted)")],
+        SandboxNetPolicy::Blocked => vec![SandboxRow::message("None")],
+        SandboxNetPolicy::Restricted { allowed_domains } if allowed_domains.is_empty() => {
+            vec![SandboxRow::message("None")]
+        }
+        SandboxNetPolicy::Restricted { allowed_domains } => allowed_domains
+            .iter()
+            .map(|domain| SandboxRow::domain(domain.clone()))
+            .collect(),
+    }
+}
+
 impl ThreadView {
-    pub(crate) fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
+    fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
+        let max_content_width = AgentSettings::get_global(cx).max_content_width;
+        let centered_container = move |content: AnyElement| {
+            h_flex().w_full().justify_center().child(
+                div()
+                    .when_some(max_content_width, |this, max_w| this.max_w(max_w))
+                    .w_full()
+                    .child(content),
+            )
+        };
+
         list(
             self.list_state.clone(),
-            cx.processor(|this, index: usize, window, cx| {
+            cx.processor(move |this, index: usize, window, cx| {
                 let entries = this.thread.read(cx).entries();
-                let Some(entry) = entries.get(index) else {
-                    return Empty.into_any();
-                };
-                this.render_entry(index, entries.len(), entry, window, cx)
+                if let Some(entry) = entries.get(index) {
+                    let rendered = this.render_entry(index, entries.len(), entry, window, cx);
+                    centered_container(rendered.into_any_element()).into_any_element()
+                } else if this.generating_indicator_in_list {
+                    let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
+                        || this.has_pending_request_elicitation(cx);
+                    let rendered = this.render_generating(confirmation, cx);
+                    centered_container(rendered.into_any_element()).into_any_element()
+                } else {
+                    Empty.into_any()
+                }
             }),
         )
         .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
-        .flex_grow()
+        .flex_grow_1()
     }
 
     fn render_entry(
@@ -3972,6 +6755,8 @@ impl ThreadView {
                 .get(entry_ix.saturating_sub(1))
                 .is_none_or(|entry| !entry.is_indented());
 
+        let mut assistant_message_is_blank = false;
+
         let primary = match &entry {
             AgentThreadEntry::UserMessage(message) => {
                 let Some(editor) = self
@@ -3987,12 +6772,9 @@ impl ThreadView {
                 let editing = self.editing_message == Some(entry_ix);
                 let editor_focus = editor.focus_handle(cx).is_focused(window);
                 let focus_border = cx.theme().colors().border_focused;
-
-                let rules_item = if entry_ix == 0 {
-                    self.render_rules_item(cx)
-                } else {
-                    None
-                };
+                // Drop shadows render as a dark halo on transparent windows.
+                let opaque_window = cx.theme().window_background_appearance()
+                    == gpui::WindowBackgroundAppearance::Opaque;
 
                 let has_checkpoint_button = message
                     .checkpoint
@@ -4000,7 +6782,16 @@ impl ThreadView {
                     .is_some_and(|checkpoint| checkpoint.show);
 
                 let is_subagent = self.is_subagent();
-                let is_editable = message.id.is_some() && !is_subagent;
+                let can_restore_checkpoint = self
+                    .thread
+                    .read(cx)
+                    .can_rewind_to(message.client_id.as_ref(), cx);
+                let source_is_representable = message
+                    .content
+                    .source_blocks()
+                    .iter()
+                    .all(acp_thread::content::can_convert_to_v1);
+                let is_editable = can_restore_checkpoint && source_is_representable;
                 let agent_name = if is_subagent {
                     "subagents".into()
                 } else {
@@ -4012,10 +6803,6 @@ impl ThreadView {
                     .map(|this| {
                         if is_first_indented {
                             this.pt_0p5()
-                        } else if entry_ix == 0 && !has_checkpoint_button && rules_item.is_none()  {
-                            this.pt(rems_from_px(18.))
-                        } else if rules_item.is_some() {
-                            this.pt_3()
                         } else {
                             this.pt_2()
                         }
@@ -4024,9 +6811,8 @@ impl ThreadView {
                     .px_2()
                     .gap_1p5()
                     .w_full()
-                    .children(rules_item)
-                    .when(is_editable && has_checkpoint_button, |this| {
-                        this.children(message.id.clone().map(|message_id| {
+                    .when(can_restore_checkpoint && has_checkpoint_button, |this| {
+                        this.children(message.client_id.clone().map(|client_id| {
                             h_flex()
                                 .px_3()
                                 .gap_2()
@@ -4038,7 +6824,7 @@ impl ThreadView {
                                         .color(Color::Muted)
                                         .tooltip(Tooltip::text("Restores all files in the project to the content they had at this point in the conversation."))
                                         .on_click(cx.listener(move |this, _, _window, cx| {
-                                            this.restore_checkpoint(&message_id, cx);
+                                            this.restore_checkpoint(&client_id, cx);
                                         }))
                                 )
                                 .child(Divider::horizontal())
@@ -4055,7 +6841,9 @@ impl ThreadView {
                                     .bg(cx.theme().colors().editor_background)
                                     .border_1()
                                     .when(is_indented, |this| {
-                                        this.py_2().px_2().shadow_sm()
+                                        this.py_2().px_2().when(opaque_window, |this| {
+                                            this.shadow_sm()
+                                        })
                                     })
                                     .border_color(cx.theme().colors().border)
                                     .map(|this| {
@@ -4071,9 +6859,10 @@ impl ThreadView {
                                         if editing && !editor_focus {
                                             return this.border_dashed()
                                         }
-                                        this.shadow_md().hover(|s| {
-                                            s.border_color(focus_border.opacity(0.8))
-                                        })
+                                        this.when(opaque_window, |this| this.shadow_md())
+                                            .hover(|s| {
+                                                s.border_color(focus_border.opacity(0.8))
+                                            })
                                     })
                                     .text_xs()
                                     .child(editor.clone().into_any_element())
@@ -4142,10 +6931,14 @@ impl ThreadView {
                                                             .child(Label::new("Unavailable Editing"))
                                                             .child(
                                                                 div().max_w_64().child(
-                                                                    Label::new(format!(
-                                                                        "Editing previous messages is not available for {} yet.",
-                                                                        agent_name
-                                                                    ))
+                                                                    Label::new(if source_is_representable {
+                                                                        format!(
+                                                                            "Editing previous messages is not available for {} yet.",
+                                                                            agent_name
+                                                                        )
+                                                                    } else {
+                                                                        "This message contains unsupported content and cannot be edited or resent.".to_string()
+                                                                    })
                                                                     .size(LabelSize::Small)
                                                                     .color(Color::Muted),
                                                                 ),
@@ -4167,48 +6960,38 @@ impl ThreadView {
                 let mut is_blank = true;
                 let is_last = entry_ix + 1 == total_entries;
 
-                let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
                 let message_body = v_flex()
                     .w_full()
                     .gap_3()
                     .children(chunks.iter().enumerate().filter_map(
                         |(chunk_ix, chunk)| match chunk {
-                            AssistantMessageChunk::Message { block } => {
-                                block.markdown().and_then(|md| {
-                                    let this_is_blank = md.read(cx).source().trim().is_empty();
-                                    is_blank = is_blank && this_is_blank;
-                                    if this_is_blank {
-                                        return None;
-                                    }
-
-                                    Some(
-                                        self.render_markdown(md.clone(), style.clone())
-                                            .into_any_element(),
-                                    )
+                            AssistantMessageChunk::Message { block, .. } => {
+                                let this_is_blank = !block.visible_content(cx);
+                                is_blank = is_blank && this_is_blank;
+                                (!this_is_blank).then(|| {
+                                    div()
+                                        .id(("assistant-message-chunk", chunk_ix))
+                                        .child(self.render_message_content(
+                                            entry_ix, chunk_ix, block, window, cx,
+                                        ))
+                                        .into_any_element()
                                 })
                             }
-                            AssistantMessageChunk::Thought { block } => {
-                                block.markdown().and_then(|md| {
-                                    let this_is_blank = md.read(cx).source().trim().is_empty();
-                                    is_blank = is_blank && this_is_blank;
-                                    if this_is_blank {
-                                        return None;
-                                    }
-                                    Some(
-                                        self.render_thinking_block(
-                                            entry_ix,
-                                            chunk_ix,
-                                            md.clone(),
-                                            window,
-                                            cx,
-                                        )
-                                        .into_any_element(),
+                            AssistantMessageChunk::Thought { block, .. } => {
+                                let this_is_blank = !block.visible_content(cx);
+                                is_blank = is_blank && this_is_blank;
+                                (!this_is_blank).then(|| {
+                                    self.render_thinking_block(
+                                        entry_ix, chunk_ix, block, window, cx,
                                     )
+                                    .into_any_element()
                                 })
                             }
                         },
                     ))
                     .into_any();
+
+                assistant_message_is_blank = is_blank;
 
                 if is_blank {
                     Empty.into_any()
@@ -4219,7 +7002,7 @@ impl ThreadView {
                         .when(is_last, |this| this.pb_4())
                         .w_full()
                         .text_ui(cx)
-                        .child(self.render_message_context_menu(entry_ix, message_body, cx))
+                        .child(message_body)
                         .when_some(
                             self.entry_view_state
                                 .read(cx)
@@ -4230,17 +7013,79 @@ impl ThreadView {
                         .into_any()
                 }
             }
-            AgentThreadEntry::ToolCall(tool_call) => self
-                .render_any_tool_call(
-                    &self.id,
+            AgentThreadEntry::ToolCall(tool_call) => {
+                // A canceled tool call that produced visible output is still worth
+                // showing, but one that was canceled before producing anything just
+                // renders as a useless "Canceled" card — hide those entirely.
+                if matches!(tool_call.status(), ToolCallStatus::Canceled) {
+                    let has_visible_content =
+                        tool_call.content().iter().any(|content| match content {
+                            ToolCallContent::ContentBlock { block, .. } => {
+                                block.visible_content(cx)
+                            }
+                            ToolCallContent::Diff(_)
+                            | ToolCallContent::LegacyDiff { .. }
+                            | ToolCallContent::Terminal { .. } => true,
+                            ToolCallContent::DiffPatch { render, .. } => {
+                                !render.files.is_empty()
+                                    || render.fallback.as_ref().is_some_and(|markdown| {
+                                        !markdown.read(cx).source().is_empty()
+                                    })
+                            }
+                            ToolCallContent::Other { markdown, .. } => {
+                                !markdown.read(cx).source().is_empty()
+                            }
+                        });
+                    if !has_visible_content {
+                        return Empty.into_any();
+                    }
+                }
+
+                let tool_call = self.render_any_tool_call(
+                    self.thread.read(cx).session_id(),
                     entry_ix,
                     tool_call,
                     &self.focus_handle(cx),
-                    false,
+                    ToolCallLayout::Standalone,
                     window,
                     cx,
-                )
-                .into_any(),
+                );
+
+                if let Some(handle) = self
+                    .entry_view_state
+                    .read(cx)
+                    .entry(entry_ix)
+                    .and_then(|entry| entry.focus_handle(cx))
+                {
+                    tool_call.track_focus(&handle).into_any()
+                } else {
+                    tool_call.into_any()
+                }
+            }
+            AgentThreadEntry::Elicitation(elicitation_id) => {
+                let thread = self.thread.read(cx);
+                if let Some((_, elicitation)) = thread.elicitation(elicitation_id)
+                    && should_render_elicitation(elicitation)
+                {
+                    let elicitation = self.render_elicitation(entry_ix, elicitation, window, cx);
+
+                    if let Some(handle) = self
+                        .entry_view_state
+                        .read(cx)
+                        .entry(entry_ix)
+                        .and_then(|entry| entry.focus_handle(cx))
+                    {
+                        elicitation.track_focus(&handle).into_any()
+                    } else {
+                        elicitation.into_any()
+                    }
+                } else {
+                    Empty.into_any()
+                }
+            }
+            AgentThreadEntry::ContextCompaction(compaction) => {
+                self.render_context_compaction(entry_ix, compaction, window, cx)
+            }
         };
 
         let is_subagent_output = self.is_subagent()
@@ -4279,11 +7124,13 @@ impl ThreadView {
             primary
         };
 
+        let thread = self.thread.clone();
+
         let primary = if is_indented {
             let line_top = if is_first_indented {
-                rems_from_px(-12.0)
+                rems_from_px(-12.0_f32)
             } else {
-                rems_from_px(0.0)
+                rems_from_px(0.0_f32)
             };
 
             div()
@@ -4294,7 +7141,7 @@ impl ThreadView {
                 .child(
                     div()
                         .absolute()
-                        .left(rems_from_px(18.0))
+                        .left(rems_from_px(18.0_f32))
                         .top(line_top)
                         .bottom_0()
                         .w_px()
@@ -4306,28 +7153,60 @@ impl ThreadView {
             primary
         };
 
-        let needs_confirmation = if let AgentThreadEntry::ToolCall(tool_call) = entry {
-            matches!(
-                tool_call.status,
-                ToolCallStatus::WaitingForConfirmation { .. }
-            )
-        } else {
-            false
-        };
+        let is_generating = matches!(thread.read(cx).status(), ThreadStatus::Generating);
 
-        let thread = self.thread.clone();
-        let comments_editor = self.thread_feedback.comments_editor.clone();
+        let is_turn_end = Self::entry_is_finalized_turn_end(thread.read(cx).entries(), entry_ix)
+            .unwrap_or(!is_generating);
 
-        let primary = if entry_ix + 1 == total_entries {
+        let primary = if is_turn_end && !assistant_message_is_blank {
+            let user_message_index = {
+                let thread = thread.read(cx);
+                thread
+                    .entries()
+                    .iter()
+                    .take(entry_ix)
+                    .rposition(|entry| thread.is_user_authored_scroll_target(entry))
+            };
+
             v_flex()
                 .w_full()
                 .child(primary)
-                .map(|this| {
-                    if needs_confirmation {
-                        this.child(self.render_generating(true, cx))
-                    } else {
-                        this.child(self.render_thread_controls(&thread, cx))
-                    }
+                .child(self.render_thread_controls(
+                    &thread,
+                    entry_ix,
+                    Some(entry_ix),
+                    entry_ix + 1 == total_entries,
+                    user_message_index,
+                    cx,
+                ))
+                .into_any_element()
+        } else {
+            primary
+        };
+
+        let is_assistant = matches!(entry, AgentThreadEntry::AssistantMessage(_));
+
+        let comments_editor = self.thread_feedback.comments_editor.clone();
+
+        let primary = if entry_ix + 1 == total_entries {
+            let last_assistant_index = thread
+                .read(cx)
+                .entries()
+                .iter()
+                .rposition(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_)));
+
+            v_flex()
+                .w_full()
+                .child(primary)
+                .when(!is_assistant, |this| {
+                    this.child(self.render_thread_controls(
+                        &thread,
+                        entry_ix,
+                        last_assistant_index,
+                        true,
+                        None,
+                        cx,
+                    ))
                 })
                 .when_some(comments_editor, |this, editor| {
                     this.child(Self::render_feedback_feedback_editor(editor, cx))
@@ -4360,6 +7239,100 @@ impl ThreadView {
         } else {
             primary
         }
+    }
+
+    fn render_elicitation(
+        &self,
+        entry_ix: usize,
+        elicitation: &Elicitation,
+        _window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        ElicitationCard::new(
+            entry_ix,
+            elicitation,
+            self.agent_display_name.clone(),
+            self.elicitation_form_states.get(&elicitation.id),
+            self.elicitation_card_handlers(cx),
+        )
+        .render(cx)
+    }
+
+    fn elicitation_card_handlers(&self, cx: &Context<Self>) -> ElicitationCardHandlers {
+        let view = cx.entity().downgrade();
+
+        ElicitationCardHandlers::new(
+            {
+                let view = view.clone();
+                move |elicitation_id, window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.submit_elicitation(elicitation_id, window, cx);
+                    })
+                    .log_err();
+                }
+            },
+            {
+                let view = view.clone();
+                move |elicitation_id, window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.decline_elicitation(elicitation_id, window, cx);
+                    })
+                    .log_err();
+                }
+            },
+            {
+                let view = view.clone();
+                move |elicitation_id, window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.cancel_elicitation(elicitation_id, window, cx);
+                    })
+                    .log_err();
+                }
+            },
+            {
+                let view = view.clone();
+                move |elicitation_id, window, cx| {
+                    view.update(cx, |this, cx| {
+                        this.dismiss_url_elicitation(elicitation_id, window, cx);
+                    })
+                    .log_err();
+                }
+            },
+            move |_elicitation_id, url, _window, cx| cx.open_url(&url),
+            {
+                let view = view.clone();
+                move |elicitation_id, field_name, value, cx| {
+                    view.update(cx, |this, cx| {
+                        if let Some(form) = this.elicitation_form_states.get_mut(&elicitation_id) {
+                            form.set_boolean(&field_name, value);
+                            cx.notify();
+                        }
+                    })
+                    .log_err();
+                }
+            },
+            {
+                let view = view.clone();
+                move |elicitation_id, field_name, value, cx| {
+                    view.update(cx, |this, cx| {
+                        if let Some(form) = this.elicitation_form_states.get_mut(&elicitation_id) {
+                            form.set_single_select(&field_name, value);
+                            cx.notify();
+                        }
+                    })
+                    .log_err();
+                }
+            },
+            move |elicitation_id, field_name, value, selected, cx| {
+                view.update(cx, |this, cx| {
+                    if let Some(form) = this.elicitation_form_states.get_mut(&elicitation_id) {
+                        form.set_multi_select(&field_name, value, selected);
+                        cx.notify();
+                    }
+                })
+                .log_err();
+            },
+        )
     }
 
     fn render_feedback_feedback_editor(editor: Entity<Editor>, cx: &Context<Self>) -> Div {
@@ -4404,48 +7377,84 @@ impl ThreadView {
             )
     }
 
+    /// A turn ends when no further assistant output (message or tool call)
+    /// follows before the next user message, and it's finalized once a user
+    /// message follows it.
+    fn entry_is_finalized_turn_end(entries: &[AgentThreadEntry], entry_ix: usize) -> Option<bool> {
+        if !matches!(
+            entries.get(entry_ix),
+            Some(AgentThreadEntry::AssistantMessage(_))
+        ) {
+            return Some(false);
+        }
+
+        for entry in &entries[entry_ix + 1..] {
+            match entry {
+                AgentThreadEntry::UserMessage(_) => return Some(true),
+                AgentThreadEntry::AssistantMessage(_) | AgentThreadEntry::ToolCall(_) => {
+                    return Some(false);
+                }
+                _ => {}
+            }
+        }
+
+        None
+    }
+
     fn render_thread_controls(
         &self,
         thread: &Entity<AcpThread>,
+        entry_ix: usize,
+        copy_response_index: Option<usize>,
+        is_thread_bottom: bool,
+        user_message_index: Option<usize>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let is_generating = matches!(thread.read(cx).status(), ThreadStatus::Generating);
-        if is_generating {
-            return self.render_generating(false, cx).into_any_element();
+        let needs_confirmation = thread.read(cx).is_waiting_for_confirmation()
+            || self.has_pending_request_elicitation(cx);
+
+        if is_thread_bottom && (is_generating || needs_confirmation) {
+            return Empty.into_any_element();
         }
 
-        let open_as_markdown = IconButton::new("open-as-markdown", IconName::FileMarkdown)
-            .shape(ui::IconButtonShape::Square)
-            .icon_size(IconSize::Small)
-            .icon_color(Color::Ignored)
-            .tooltip(Tooltip::text("Open Thread as Markdown"))
-            .on_click(cx.listener(move |this, _, window, cx| {
-                if let Some(workspace) = this.workspace.upgrade() {
-                    this.open_thread_as_markdown(workspace, window, cx)
-                        .detach_and_log_err(cx);
-                }
-            }));
-
-        let scroll_to_recent_user_prompt =
-            IconButton::new("scroll_to_recent_user_prompt", IconName::ForwardArrow)
-                .shape(ui::IconButtonShape::Square)
+        let copy_response_button = copy_response_index.map(|response_index| {
+            IconButton::new(("copy_agent_response", entry_ix), IconName::Copy)
                 .icon_size(IconSize::Small)
-                .icon_color(Color::Ignored)
-                .tooltip(Tooltip::text("Scroll To Most Recent User Prompt"))
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Copy This Agent Response"))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.scroll_to_most_recent_user_prompt(cx);
-                }));
+                    let entries = this.thread.read(cx).entries();
+                    if let Some(text) = Self::get_agent_message_content(entries, response_index, cx)
+                    {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    }
+                }))
+        });
 
-        let scroll_to_top = IconButton::new("scroll_to_top", IconName::ArrowUp)
-            .shape(ui::IconButtonShape::Square)
-            .icon_size(IconSize::Small)
-            .icon_color(Color::Ignored)
-            .tooltip(Tooltip::text("Scroll To Top"))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.scroll_to_top(cx);
-            }));
+        let scroll_to_recent_user_prompt = IconButton::new(
+            ("scroll_to_recent_user_prompt", entry_ix),
+            IconName::UserArrowUp,
+        )
+        .icon_size(IconSize::Small)
+        .icon_color(Color::Muted)
+        .tooltip(Tooltip::text("Scroll to User Message"))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.scroll_to_user_message_index(user_message_index, cx);
+        }));
 
-        let show_stats = AgentSettings::get_global(cx).show_turn_stats;
+        let scroll_to_top = is_thread_bottom.then(|| {
+            IconButton::new(("scroll_to_top", entry_ix), IconName::ArrowUp)
+                .icon_size(IconSize::Small)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Scroll to Top"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.scroll_to_top(cx);
+                }))
+        });
+
+        let show_stats = is_thread_bottom && AgentSettings::get_global(cx).show_turn_stats;
+
         let last_turn_clock = show_stats
             .then(|| {
                 self.turn_fields
@@ -4466,158 +7475,187 @@ impl ThreadView {
                     .last_turn_tokens
                     .filter(|&tokens| tokens > TOKEN_THRESHOLD)
                     .map(|tokens| {
-                        Label::new(format!(
-                            "{} tokens",
-                            crate::text_thread_editor::humanize_token_count(tokens)
-                        ))
-                        .size(LabelSize::Small)
-                        .color(Color::Muted)
+                        Label::new(format!("{} tokens", crate::humanize_token_count(tokens)))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
                     })
             })
             .flatten();
 
-        let mut container = h_flex()
+        let feedback_buttons = is_thread_bottom
+            .then(|| {
+                (self.is_subagent() && self.is_thread_feedback_enabled(cx)).then(|| {
+                    let feedback = self.thread_feedback.feedback;
+                    let tooltip_meta =
+                        "Rating the thread sends all of your current conversation to the Zed team.";
+
+                    h_flex()
+                        .child(
+                            IconButton::new("feedback-thumbs-up", IconName::ThumbsUp)
+                                .icon_size(IconSize::Small)
+                                .icon_color(match feedback {
+                                    Some(ThreadFeedback::Positive) => Color::Accent,
+                                    _ => Color::Muted,
+                                })
+                                .tooltip(move |window, cx| match feedback {
+                                    Some(ThreadFeedback::Positive) => {
+                                        Tooltip::text("Thanks for your feedback!")(window, cx)
+                                    }
+                                    _ => Tooltip::with_meta(
+                                        "Helpful Response",
+                                        None,
+                                        tooltip_meta,
+                                        cx,
+                                    ),
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.handle_feedback_click(ThreadFeedback::Positive, window, cx);
+                                })),
+                        )
+                        .child(
+                            IconButton::new("feedback-thumbs-down", IconName::ThumbsDown)
+                                .icon_size(IconSize::Small)
+                                .icon_color(match feedback {
+                                    Some(ThreadFeedback::Negative) => Color::Accent,
+                                    _ => Color::Muted,
+                                })
+                                .tooltip(move |window, cx| match feedback {
+                                    Some(ThreadFeedback::Negative) => Tooltip::text(
+                                        "We appreciate your feedback and will use it to improve in the future.",
+                                    )(
+                                        window, cx
+                                    ),
+                                    _ => Tooltip::with_meta(
+                                        "Not Helpful Response",
+                                        None,
+                                        tooltip_meta,
+                                        cx,
+                                    ),
+                                })
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.handle_feedback_click(ThreadFeedback::Negative, window, cx);
+                                })),
+                        )
+                })
+            })
+            .flatten();
+
+        let separator_dots = || {
+            Label::new("•")
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .alpha(0.5)
+        };
+
+        h_flex()
             .w_full()
-            .py_2()
-            .px_5()
-            .gap_px()
-            .opacity(0.6)
-            .hover(|s| s.opacity(1.))
+            .py_1p5()
+            .px_4()
             .justify_end()
+            .opacity(0.4)
+            .hover(|s| s.opacity(1.))
             .when(
                 last_turn_tokens_label.is_some() || last_turn_clock.is_some(),
                 |this| {
                     this.child(
                         h_flex()
-                            .gap_1()
                             .px_1()
-                            .when_some(last_turn_tokens_label, |this, label| this.child(label))
-                            .when_some(last_turn_clock, |this, label| this.child(label)),
+                            .gap_1()
+                            .when_some(last_turn_tokens_label, |this, label| {
+                                this.child(label).child(separator_dots())
+                            })
+                            .when_some(last_turn_clock, |this, label| {
+                                this.child(label).child(separator_dots())
+                            }),
                     )
                 },
-            );
-
-        if AgentSettings::get_global(cx).enable_feedback
-            && self.thread.read(cx).connection().telemetry().is_some()
-        {
-            let feedback = self.thread_feedback.feedback;
-
-            let tooltip_meta = || {
-                SharedString::new(
-                    "Rating the thread sends all of your current conversation to the Zed team.",
-                )
-            };
-
-            container = container
-                    .child(
-                        IconButton::new("feedback-thumbs-up", IconName::ThumbsUp)
-                            .shape(ui::IconButtonShape::Square)
-                            .icon_size(IconSize::Small)
-                            .icon_color(match feedback {
-                                Some(ThreadFeedback::Positive) => Color::Accent,
-                                _ => Color::Ignored,
-                            })
-                            .tooltip(move |window, cx| match feedback {
-                                Some(ThreadFeedback::Positive) => {
-                                    Tooltip::text("Thanks for your feedback!")(window, cx)
-                                }
-                                _ => {
-                                    Tooltip::with_meta("Helpful Response", None, tooltip_meta(), cx)
-                                }
-                            })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.handle_feedback_click(ThreadFeedback::Positive, window, cx);
-                            })),
-                    )
-                    .child(
-                        IconButton::new("feedback-thumbs-down", IconName::ThumbsDown)
-                            .shape(ui::IconButtonShape::Square)
-                            .icon_size(IconSize::Small)
-                            .icon_color(match feedback {
-                                Some(ThreadFeedback::Negative) => Color::Accent,
-                                _ => Color::Ignored,
-                            })
-                            .tooltip(move |window, cx| match feedback {
-                                Some(ThreadFeedback::Negative) => {
-                                    Tooltip::text(
-                                    "We appreciate your feedback and will use it to improve in the future.",
-                                )(window, cx)
-                                }
-                                _ => {
-                                    Tooltip::with_meta(
-                                        "Not Helpful Response",
-                                        None,
-                                        tooltip_meta(),
-                                        cx,
-                                    )
-                                }
-                            })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.handle_feedback_click(ThreadFeedback::Negative, window, cx);
-                            })),
-                    );
-        }
-
-        if let Some(project) = self.project.upgrade()
-            && let Some(server_view) = self.server_view.upgrade()
-            && cx.has_flag::<AgentSharingFeatureFlag>()
-            && project.read(cx).client().status().borrow().is_connected()
-        {
-            let button = if self.is_imported_thread(cx) {
-                IconButton::new("sync-thread", IconName::ArrowCircle)
-                    .shape(ui::IconButtonShape::Square)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Ignored)
-                    .tooltip(Tooltip::text("Sync with source thread"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.sync_thread(project.clone(), server_view.clone(), window, cx);
-                    }))
-            } else {
-                IconButton::new("share-thread", IconName::ArrowUpRight)
-                    .shape(ui::IconButtonShape::Square)
-                    .icon_size(IconSize::Small)
-                    .icon_color(Color::Ignored)
-                    .tooltip(Tooltip::text("Share Thread"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.share_thread(window, cx);
-                    }))
-            };
-
-            container = container.child(button);
-        }
-
-        container
-            .child(open_as_markdown)
+            )
+            .when_some(feedback_buttons, |this, buttons| this.child(buttons))
+            .when_some(copy_response_button, |this, button| this.child(button))
             .child(scroll_to_recent_user_prompt)
-            .child(scroll_to_top)
+            .when_some(scroll_to_top, |this, button| this.child(button))
             .into_any_element()
     }
 
-    pub(crate) fn scroll_to_most_recent_user_prompt(&mut self, cx: &mut Context<Self>) {
-        let entries = self.thread.read(cx).entries();
+    fn is_thread_feedback_enabled(&self, cx: &App) -> bool {
+        util::maybe!({
+            let project = self.thread.read(cx).project().read(cx);
+            let user_store = project.user_store();
+            if let Some(configuration) = user_store.read(cx).current_organization_configuration() {
+                if !configuration.is_agent_thread_feedback_enabled {
+                    return false;
+                }
+            }
+
+            AgentSettings::get_global(cx).enable_feedback
+                && self.thread.read(cx).connection().telemetry().is_some()
+        })
+    }
+
+    // The local slash commands the message editor should currently expose.
+    // Kept in sync with the availability of the corresponding actions via
+    // `sync_local_commands`.
+    fn available_local_commands(&self, cx: &App) -> Vec<PromptLocalCommand> {
+        let mut commands = Vec::new();
+
+        if self.is_thread_feedback_enabled(cx) {
+            commands.push(PromptLocalCommand::ThumbsUp);
+            commands.push(PromptLocalCommand::ThumbsDown);
+        }
+
+        commands
+    }
+
+    // Pushes the current set of available local commands to the message
+    // editor so they appear in its slash-command popup.
+    pub(crate) fn sync_local_commands(&self, cx: &App) {
+        let commands = self.available_local_commands(cx);
+        self.message_editor.read(cx).set_local_commands(commands);
+    }
+
+    fn render_request_elicitations(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        let server_view = self.server_view.clone();
+        let handlers_view = server_view.clone();
+        server_view
+            .read_with(cx, |server_view, cx| {
+                let Some(connection) = server_view.request_elicitation_connection() else {
+                    return Vec::new();
+                };
+                server_view.render_request_elicitations(&connection, handlers_view, cx)
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn scroll_to_user_message_index(
+        &mut self,
+        user_message_index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
         if entries.is_empty() {
             return;
         }
 
-        // Find the most recent user message and scroll it to the top of the viewport.
+        // Scroll to the provided user message, or fall back to the most recent one.
         // (Fallback: if no user message exists, scroll to the bottom.)
-        if let Some(ix) = entries
-            .iter()
-            .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
-        {
+        if let Some(ix) = user_message_index.or_else(|| {
+            entries
+                .iter()
+                .rposition(|entry| thread.is_user_authored_scroll_target(entry))
+        }) {
             self.list_state.scroll_to(ListOffset {
                 item_ix: ix,
                 offset_in_item: px(0.0),
             });
             cx.notify();
         } else {
-            self.scroll_to_bottom(cx);
+            self.scroll_to_end(cx);
         }
     }
 
-    pub fn scroll_to_bottom(&mut self, cx: &mut Context<Self>) {
-        let entry_count = self.thread.read(cx).entries().len();
-        self.list_state.reset(entry_count);
+    pub fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
+        self.list_state.scroll_to_end();
         cx.notify();
     }
 
@@ -4643,56 +7681,273 @@ impl ThreadView {
         cx.notify();
     }
 
+    fn scroll_output_page_up(
+        &mut self,
+        _: &ScrollOutputPageUp,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let page_height = self.list_state.viewport_bounds().size.height;
+        self.list_state.scroll_by(-page_height * 0.9);
+        cx.notify();
+    }
+
+    fn scroll_output_page_down(
+        &mut self,
+        _: &ScrollOutputPageDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let page_height = self.list_state.viewport_bounds().size.height;
+        self.list_state.scroll_by(page_height * 0.9);
+        cx.notify();
+    }
+
+    fn scroll_output_line_up(
+        &mut self,
+        _: &ScrollOutputLineUp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.list_state.scroll_by(-window.line_height() * 3.);
+        cx.notify();
+    }
+
+    fn scroll_output_line_down(
+        &mut self,
+        _: &ScrollOutputLineDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.list_state.scroll_by(window.line_height() * 3.);
+        cx.notify();
+    }
+
+    fn scroll_output_to_top(
+        &mut self,
+        _: &ScrollOutputToTop,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.scroll_to_top(cx);
+    }
+
+    fn scroll_output_to_bottom(
+        &mut self,
+        _: &ScrollOutputToBottom,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.scroll_to_end(cx);
+    }
+
+    fn scroll_output_to_previous_message(
+        &mut self,
+        _: &ScrollOutputToPreviousMessage,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let current_ix = self.list_state.logical_scroll_top().item_ix;
+        if let Some(target_ix) = (0..current_ix).rev().find(|&i| {
+            entries
+                .get(i)
+                .is_some_and(|entry| thread.is_user_authored_scroll_target(entry))
+        }) {
+            self.list_state.scroll_to(ListOffset {
+                item_ix: target_ix,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        }
+    }
+
+    fn scroll_output_to_next_message(
+        &mut self,
+        _: &ScrollOutputToNextMessage,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let thread = self.thread.read(cx);
+        let entries = thread.entries();
+        let current_ix = self.list_state.logical_scroll_top().item_ix;
+        if let Some(target_ix) = (current_ix + 1..entries.len()).find(|&i| {
+            entries
+                .get(i)
+                .is_some_and(|entry| thread.is_user_authored_scroll_target(entry))
+        }) {
+            self.list_state.scroll_to(ListOffset {
+                item_ix: target_ix,
+                offset_in_item: px(0.),
+            });
+            cx.notify();
+        }
+    }
+
+    fn refresh_thread_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.thread_search_visible {
+            return;
+        }
+        if let Some(bar) = self.thread_search_bar.clone() {
+            bar.update(cx, |bar, cx| bar.update_matches(window, cx));
+        }
+    }
+
+    /// Hides the thread search bar, clears its highlights, and returns focus to
+    /// the message editor. Returns `true` if the search bar was visible.
+    pub(crate) fn close_thread_search(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.thread_search_visible {
+            return false;
+        }
+
+        if let Some(bar) = self.thread_search_bar.clone() {
+            bar.update(cx, |bar, cx| bar.clear_highlights(cx));
+        }
+
+        self.thread_search_visible = false;
+        self.message_editor.focus_handle(cx).focus(window, cx);
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn toggle_search(
+        &mut self,
+        _: &crate::ToggleSearch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.thread_search_bar.is_none() {
+            let thread = self.thread.clone();
+            let view = cx.entity().downgrade();
+            let on_activate =
+                Arc::new(move |entry_ix: usize, _window: &mut Window, cx: &mut App| {
+                    // Avoid re-entering `ThreadView` when search navigation is forwarded
+                    // from a `ThreadView` action handler.
+                    let view = view.clone();
+                    cx.defer(move |cx| {
+                        view.update(cx, |this, cx| {
+                            this.list_state.scroll_to(gpui::ListOffset {
+                                item_ix: entry_ix,
+                                offset_in_item: gpui::px(0.),
+                            });
+                            cx.notify();
+                        })
+                        .ok();
+                    });
+                });
+            let search_bar = cx.new(|cx| {
+                ThreadSearchBar::new(
+                    thread,
+                    self.entry_view_state.clone(),
+                    on_activate,
+                    window,
+                    cx,
+                )
+            });
+            self._subscriptions.push(cx.subscribe_in(
+                &search_bar,
+                window,
+                |this, _bar, event, window, cx| {
+                    if matches!(event, ThreadSearchBarEvent::Dismissed) {
+                        this.thread_search_visible = false;
+                        this.message_editor.focus_handle(cx).focus(window, cx);
+                        cx.notify();
+                    }
+                },
+            ));
+            self.thread_search_bar = Some(search_bar);
+        }
+
+        // Re-focus an open bar unless it already owns focus.
+        let search_bar_focused = self
+            .thread_search_bar
+            .as_ref()
+            .is_some_and(|bar| bar.focus_handle(cx).contains_focused(window, cx));
+
+        if self.thread_search_visible && search_bar_focused {
+            if let Some(bar) = &self.thread_search_bar {
+                bar.update(cx, |bar, cx| bar.clear_highlights(cx));
+            }
+            self.thread_search_visible = false;
+            self.message_editor.focus_handle(cx).focus(window, cx);
+            cx.notify();
+        } else {
+            self.thread_search_visible = true;
+            if let Some(bar) = self.thread_search_bar.clone() {
+                bar.update(cx, |bar, cx| bar.focus_and_refresh(window, cx));
+            }
+            cx.notify();
+        }
+    }
+
     pub fn open_thread_as_markdown(
         &self,
         workspace: Entity<Workspace>,
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<()>> {
-        let markdown_language_task = workspace
-            .read(cx)
-            .app_state()
-            .languages
-            .language_for_name("Markdown");
-
         let thread = self.thread.read(cx);
-        let thread_title = thread.title().to_string();
+        let thread_title = thread
+            .title()
+            .unwrap_or_else(|| DEFAULT_THREAD_TITLE.into())
+            .to_string();
         let markdown = thread.to_markdown(cx);
 
-        let project = workspace.read(cx).project().clone();
-        window.spawn(cx, async move |cx| {
-            let markdown_language = markdown_language_task.await?;
+        open_markdown_in_workspace(thread_title, markdown, workspace, window, cx)
+    }
 
-            let buffer = project
-                .update(cx, |project, cx| {
-                    project.create_buffer(Some(markdown_language), false, cx)
-                })
-                .await?;
+    pub(crate) fn sync_editor_mode(&mut self, cx: &mut Context<Self>) {
+        let has_messages = self.list_state.item_count() > 0;
+        let v2_empty_state = !has_messages;
 
-            buffer.update(cx, |buffer, cx| {
-                buffer.set_text(markdown, cx);
-                buffer.set_capability(language::Capability::ReadWrite, cx);
-            });
+        if !has_messages {
+            self.editor_expanded = false;
+        }
 
-            workspace.update_in(cx, |workspace, window, cx| {
-                let buffer = cx
-                    .new(|cx| MultiBuffer::singleton(buffer, cx).with_title(thread_title.clone()));
+        let mode = if self.editor_expanded {
+            EditorMode::Full {
+                scale_ui_elements_with_buffer_font_size: false,
+                show_active_line_background: false,
+                sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+            }
+        } else if v2_empty_state {
+            EditorMode::Full {
+                scale_ui_elements_with_buffer_font_size: false,
+                show_active_line_background: false,
+                sizing_behavior: SizingBehavior::Default,
+            }
+        } else {
+            EditorMode::AutoHeight {
+                min_lines: AgentSettings::get_global(cx).message_editor_min_lines,
+                max_lines: Some(AgentSettings::get_global(cx).set_message_editor_max_lines()),
+            }
+        };
+        self.message_editor.update(cx, |editor, cx| {
+            editor.set_mode(mode, cx);
+        });
+    }
 
-                workspace.add_item_to_active_pane(
-                    Box::new(cx.new(|cx| {
-                        let mut editor =
-                            Editor::for_multibuffer(buffer, Some(project.clone()), window, cx);
-                        editor.set_breadcrumb_header(thread_title);
-                        editor
-                    })),
-                    None,
-                    true,
-                    window,
-                    cx,
-                );
-            })?;
-            anyhow::Ok(())
-        })
+    /// Ensures the list item count includes (or excludes) an extra item for the generating indicator
+    pub(crate) fn sync_generating_indicator(&mut self, cx: &App) {
+        let thread = self.thread.read(cx);
+
+        let is_generating =
+            matches!(thread.status(), ThreadStatus::Generating) && !thread.is_compacting();
+
+        if is_generating && !self.generating_indicator_in_list {
+            let entries_count = self.thread.read(cx).entries().len();
+            self.list_state.splice(entries_count..entries_count, 1);
+            self.generating_indicator_in_list = true;
+        } else if !is_generating && self.generating_indicator_in_list {
+            let entries_count = self.thread.read(cx).entries().len();
+            self.list_state.splice(entries_count..entries_count + 1, 0);
+            self.generating_indicator_in_list = false;
+        }
     }
 
     fn render_generating(&self, confirmation: bool, cx: &App) -> impl IntoElement {
@@ -4716,7 +7971,7 @@ impl ThreadView {
                 self.turn_fields
                     .turn_tokens
                     .filter(|&tokens| tokens > TOKEN_THRESHOLD)
-                    .map(|tokens| crate::text_thread_editor::humanize_token_count(tokens))
+                    .map(|tokens| crate::humanize_token_count(tokens))
             })
             .flatten();
 
@@ -4729,26 +7984,33 @@ impl ThreadView {
         h_flex()
             .id("generating-spinner")
             .py_2()
-            .px(rems_from_px(22.))
+            .px(rems_from_px(22_f32))
             .gap_2()
             .map(|this| {
                 if confirmation {
                     this.child(
                         h_flex()
                             .w_2()
-                            .child(SpinnerLabel::sand().size(LabelSize::Small)),
+                            .justify_center()
+                            .child(GeneratingSpinnerElement::new(SpinnerVariant::Sand)),
                     )
                     .child(
                         div().min_w(rems(8.)).child(
                             LoadingLabel::new("Awaiting Confirmation")
                                 .size(LabelSize::Small)
-                                .color(Color::Muted),
+                                .color(Color::Muted)
+                                .single_line(),
                         ),
                     )
                 } else if is_blocked_on_terminal_command {
                     this
                 } else {
-                    this.child(SpinnerLabel::new().size(LabelSize::Small))
+                    this.child(
+                        h_flex()
+                            .w_2()
+                            .justify_center()
+                            .child(GeneratingSpinnerElement::new(SpinnerVariant::Dots)),
+                    )
                 }
             })
             .when_some(elapsed_label, |this, elapsed| {
@@ -4777,58 +8039,76 @@ impl ThreadView {
             .into_any_element()
     }
 
-    /// If the last entry's last chunk is a streaming thought block, auto-expand it.
-    /// Also collapses the previously auto-expanded block when a new one starts.
     pub(crate) fn auto_expand_streaming_thought(&mut self, cx: &mut Context<Self>) {
-        let key = {
-            let thread = self.thread.read(cx);
+        let thread = self.thread.clone();
+        let changed = self.entry_view_state.update(cx, |state, cx| {
+            let thread = thread.read(cx);
             if thread.status() != ThreadStatus::Generating {
-                return;
+                return false;
             }
-            let entries = thread.entries();
-            let last_ix = entries.len().saturating_sub(1);
-            match entries.get(last_ix) {
-                Some(AgentThreadEntry::AssistantMessage(msg)) => match msg.chunks.last() {
-                    Some(AssistantMessageChunk::Thought { .. }) => {
-                        Some((last_ix, msg.chunks.len() - 1))
-                    }
-                    _ => None,
-                },
-                _ => None,
-            }
-        };
-
-        if let Some(key) = key {
-            if self.auto_expanded_thinking_block != Some(key) {
-                if let Some(old_key) = self.auto_expanded_thinking_block.replace(key) {
-                    self.expanded_thinking_blocks.remove(&old_key);
-                }
-                self.expanded_thinking_blocks.insert(key);
-                cx.notify();
-            }
-        } else if self.auto_expanded_thinking_block.is_some() {
-            // The last chunk is no longer a thought (model transitioned to responding),
-            // so collapse the previously auto-expanded block.
-            self.collapse_auto_expanded_thinking_block();
+            state.auto_expand_streaming_thought(thread, cx)
+        });
+        if changed {
             cx.notify();
         }
     }
 
-    fn collapse_auto_expanded_thinking_block(&mut self) {
-        if let Some(key) = self.auto_expanded_thinking_block.take() {
-            self.expanded_thinking_blocks.remove(&key);
-        }
+    pub(crate) fn clear_auto_expand_tracking(&mut self, cx: &mut Context<Self>) {
+        self.entry_view_state.update(cx, |state, _cx| {
+            state.clear_auto_expand_tracking();
+        });
     }
 
-    pub(crate) fn clear_auto_expand_tracking(&mut self) {
-        self.auto_expanded_thinking_block = None;
+    fn toggle_thinking_block_expansion(
+        &mut self,
+        key: (usize, usize),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.entry_view_state.update(cx, |state, cx| {
+            state.toggle_thinking_block_expansion(key, cx);
+        });
+        self.refresh_thread_search(window, cx);
+        cx.notify();
+    }
+
+    fn render_message_content(
+        &self,
+        entry_ix: usize,
+        chunk_ix: usize,
+        content: &acp_thread::MessageContent,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        v_flex().w_full().gap_3().children(
+            content
+                .blocks()
+                .enumerate()
+                .filter(|(_, block)| block.visible_content(cx))
+                .map(|(block_ix, block)| {
+                    let content = self.render_output_content_block(
+                        entry_ix, block_ix, block, None, false, window, cx,
+                    );
+                    div()
+                        .id(("message-content-block", block_ix))
+                        .debug_selector(move || {
+                            format!("message-content-{entry_ix}-{chunk_ix}-{block_ix}")
+                        })
+                        .child(self.render_message_context_menu(
+                            entry_ix,
+                            block.markdown().cloned(),
+                            content,
+                            cx,
+                        ))
+                }),
+        )
     }
 
     fn render_thinking_block(
         &self,
         entry_ix: usize,
         chunk_ix: usize,
-        chunk: Entity<Markdown>,
+        chunk: &acp_thread::MessageContent,
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -4837,15 +8117,23 @@ impl ThreadView {
 
         let key = (entry_ix, chunk_ix);
 
-        let is_open = self.expanded_thinking_blocks.contains(&key);
-
-        let scroll_handle = self
-            .entry_view_state
-            .read(cx)
+        let entry_view_state = self.entry_view_state.read(cx);
+        let (is_open, is_constrained) = entry_view_state.thinking_block_state(key, cx);
+        let should_auto_scroll = entry_view_state.is_auto_expanded_thinking_block(key);
+        let scroll_handle = entry_view_state
             .entry(entry_ix)
             .and_then(|entry| entry.scroll_handle_for_assistant_message_chunk(chunk_ix));
 
+        if should_auto_scroll {
+            if let Some(ref handle) = scroll_handle {
+                handle.scroll_to_bottom();
+            }
+        }
+
+        let panel_bg = cx.theme().colors().panel_background;
+
         v_flex()
+            .id(("thinking-block", chunk_ix))
             .gap_1()
             .child(
                 h_flex()
@@ -4877,42 +8165,46 @@ impl ThreadView {
                             .opened_icon(IconName::ChevronUp)
                             .closed_icon(IconName::ChevronDown)
                             .visible_on_hover(&card_header_id)
-                            .on_click(cx.listener({
-                                move |this, _event, _window, cx| {
-                                    if is_open {
-                                        this.expanded_thinking_blocks.remove(&key);
-                                    } else {
-                                        this.expanded_thinking_blocks.insert(key);
-                                    }
-                                    cx.notify();
-                                }
+                            .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                                this.toggle_thinking_block_expansion(key, window, cx);
                             })),
                     )
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        if is_open {
-                            this.expanded_thinking_blocks.remove(&key);
-                        } else {
-                            this.expanded_thinking_blocks.insert(key);
-                        }
-                        cx.notify();
-                    })),
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                        this.toggle_thinking_block_expansion(key, window, cx);
+                    }))
+                    .map(|header| {
+                        self.render_message_context_menu(entry_ix, None, header.into_any(), cx)
+                    }),
             )
             .when(is_open, |this| {
                 this.child(
                     div()
-                        .id(("thinking-content", chunk_ix))
-                        .ml_1p5()
-                        .pl_3p5()
-                        .border_l_1()
-                        .border_color(self.tool_card_border_color(cx))
-                        .when_some(scroll_handle, |this, scroll_handle| {
-                            this.track_scroll(&scroll_handle)
-                        })
-                        .overflow_hidden()
-                        .child(self.render_markdown(
-                            chunk,
-                            MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-                        )),
+                        .when(is_constrained, |this| this.relative())
+                        .child(
+                            div()
+                                .id(("thinking-content", chunk_ix))
+                                .ml_1p5()
+                                .pl_3p5()
+                                .border_l_1()
+                                .border_color(self.tool_card_border_color(cx))
+                                .when(is_constrained, |this| this.max_h_64())
+                                .when_some(scroll_handle, |this, scroll_handle| {
+                                    this.track_scroll(&scroll_handle)
+                                })
+                                .overflow_hidden()
+                                .child(
+                                    self.render_message_content(
+                                        entry_ix, chunk_ix, chunk, window, cx,
+                                    ),
+                                ),
+                        )
+                        .when(is_constrained, |this| {
+                            this.child(div().absolute().inset_0().size_full().bg(linear_gradient(
+                                180.,
+                                linear_color_stop(panel_bg.opacity(0.8), 0.),
+                                linear_color_stop(panel_bg.opacity(0.), 0.1),
+                            )))
+                        }),
                 )
             })
             .into_any_element()
@@ -4921,6 +8213,7 @@ impl ThreadView {
     fn render_message_context_menu(
         &self,
         entry_ix: usize,
+        markdown: Option<Entity<Markdown>>,
         message_body: AnyElement,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -4933,30 +8226,18 @@ impl ThreadView {
                 let focus = window.focused(cx);
                 let entity = entity.clone();
                 let workspace = workspace.clone();
+                let markdown = markdown.clone();
 
                 ContextMenu::build(window, cx, move |menu, _, cx| {
                     let this = entity.read(cx);
                     let is_at_top = this.list_state.logical_scroll_top().item_ix == 0;
-
-                    let has_selection = this
-                        .thread
-                        .read(cx)
-                        .entries()
-                        .get(entry_ix)
-                        .and_then(|entry| match &entry {
-                            AgentThreadEntry::AssistantMessage(msg) => Some(&msg.chunks),
-                            _ => None,
-                        })
-                        .map(|chunks| {
-                            chunks.iter().any(|chunk| {
-                                let md = match chunk {
-                                    AssistantMessageChunk::Message { block } => block.markdown(),
-                                    AssistantMessageChunk::Thought { block } => block.markdown(),
-                                };
-                                md.map_or(false, |m| m.read(cx).selected_text().is_some())
-                            })
-                        })
-                        .unwrap_or(false);
+                    let markdown = markdown.as_ref().map(|markdown| markdown.read(cx));
+                    let context_menu_link =
+                        markdown.and_then(|markdown| markdown.context_menu_link().cloned());
+                    let selected_text = markdown
+                        .and_then(|markdown| markdown.context_menu_selected_text().cloned());
+                    let selected_markdown = markdown
+                        .and_then(|markdown| markdown.context_menu_selected_markdown().cloned());
 
                     let copy_this_agent_response =
                         ContextMenuEntry::new("Copy This Agent Response").handler({
@@ -4978,7 +8259,7 @@ impl ThreadView {
                             let entity = entity.clone();
                             move |_, cx| {
                                 entity.update(cx, |this, cx| {
-                                    this.scroll_to_bottom(cx);
+                                    this.scroll_to_end(cx);
                                 });
                             }
                         })
@@ -5009,11 +8290,30 @@ impl ThreadView {
                         });
 
                     menu.when_some(focus, |menu, focus| menu.context(focus))
-                        .action_disabled_when(
-                            !has_selection,
-                            "Copy Selection",
-                            Box::new(markdown::CopyAsMarkdown),
-                        )
+                        .when_some(context_menu_link, |menu, url| {
+                            menu.entry("Copy Link", None, move |_, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(url.to_string()));
+                            })
+                            .separator()
+                        })
+                        .when_some(selected_text, |menu, selected_text| {
+                            menu.entry("Copy", Some(Box::new(markdown::Copy)), move |_, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    selected_text.to_string(),
+                                ));
+                            })
+                        })
+                        .when_some(selected_markdown, |menu, selected_markdown| {
+                            menu.entry(
+                                "Copy as Markdown",
+                                Some(Box::new(markdown::CopyAsMarkdown)),
+                                move |_, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        selected_markdown.to_string(),
+                                    ));
+                                },
+                            )
+                        })
                         .item(copy_this_agent_response)
                         .separator()
                         .item(scroll_item)
@@ -5052,12 +8352,12 @@ impl ThreadView {
                         .chunks
                         .iter()
                         .filter_map(|chunk| match chunk {
-                            AssistantMessageChunk::Message { block } => {
+                            AssistantMessageChunk::Message { block, .. } => {
                                 let markdown = block.to_markdown(cx);
                                 if markdown.trim().is_empty() {
                                     None
                                 } else {
-                                    Some(markdown.to_string())
+                                    Some(markdown)
                                 }
                             }
                             AssistantMessageChunk::Thought { .. } => None,
@@ -5089,17 +8389,20 @@ impl ThreadView {
                 AgentThreadEntry::UserMessage(_) => break,
                 AgentThreadEntry::ToolCall(tool_call)
                     if matches!(
-                        tool_call.status,
+                        tool_call.status(),
                         ToolCallStatus::InProgress | ToolCallStatus::Pending
                     ) =>
                 {
-                    if matches!(tool_call.kind, acp::ToolKind::Execute) {
+                    if matches!(tool_call.kind(), acp_v2::ToolKind::Execute) {
                         has_running_terminal_call = true;
                     } else {
                         return false;
                     }
                 }
-                AgentThreadEntry::ToolCall(_) | AgentThreadEntry::AssistantMessage(_) => {}
+                AgentThreadEntry::ToolCall(_)
+                | AgentThreadEntry::Elicitation(_)
+                | AgentThreadEntry::AssistantMessage(_)
+                | AgentThreadEntry::ContextCompaction(_) => {}
             }
         }
 
@@ -5110,75 +8413,98 @@ impl ThreadView {
         &self,
         group: SharedString,
         is_preview: bool,
-        command_source: &str,
+        command: Entity<Markdown>,
+        window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        v_flex()
-            .group(group.clone())
-            .p_1p5()
-            .bg(self.tool_card_header_bg(cx))
-            .when(is_preview, |this| {
-                this.pt_1().child(
-                    // Wrapping this label on a container with 24px height to avoid
-                    // layout shift when it changes from being a preview label
-                    // to the actual path where the command will run in
-                    h_flex().h_6().child(
-                        Label::new("Run Command")
-                            .buffer_font(cx)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-                )
-            })
-            .children(command_source.lines().map(|line| {
-                let text: SharedString = if line.is_empty() {
-                    " ".into()
-                } else {
-                    line.to_string().into()
-                };
+        // The label's markdown source is a fenced code block (```\n...\n```);
+        // strip the fences so the copy button yields just the command text.
+        let command_source = command.read(cx).source();
+        let command_text = command_source
+            .strip_prefix("```\n")
+            .and_then(|s| s.strip_suffix("\n```"))
+            .unwrap_or(&command_source)
+            .to_string();
 
-                Label::new(text).buffer_font(cx).size(LabelSize::Small)
-            }))
-            .child(
-                div().absolute().top_1().right_1().child(
-                    CopyButton::new("copy-command", command_source.to_string())
-                        .tooltip_label("Copy Command")
-                        .visible_on_hover(group),
+        let mut style =
+            MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_agent_buffer_font(cx);
+        style.container_style.text.font_size = Some(rems_from_px(12_f32).into());
+        style.container_style.text.line_height = Some(rems_from_px(17_f32).into());
+        style.height_is_multiple_of_line_height = true;
+        // Soft-wrap the command instead of horizontally scrolling it: the card is
+        // narrow, and in scroll mode a long command wraps anyway but its wrapped
+        // lines don't pick up the code block's left padding. Wrap mode lays the
+        // text out as a normal block inside the padded content box, so every
+        // line (wrapped or not) is padded consistently.
+        style.code_block_overflow_x_scroll = false;
+
+        let header_bg = self.tool_card_header_bg(cx);
+        let run_command_label = if is_preview {
+            Some(
+                h_flex().h_6().child(
+                    Label::new("Run Command")
+                        .buffer_font(cx)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
                 ),
             )
+        } else {
+            None
+        };
+        // Suppress the code block's built-in copy button so we don't stack two
+        // copy buttons on top of each other; the outer button below is the one
+        // we want, because it copies the unfenced command text.
+        let markdown_element = self
+            .render_markdown(command, style, cx)
+            .code_block_renderer(CodeBlockRenderer::Default {
+                copy_button_visibility: CopyButtonVisibility::Hidden,
+                wrap_button_visibility: markdown::WrapButtonVisibility::Hidden,
+                border: false,
+            });
+        let copy_button_id = SharedString::from(format!("{group}-copy-command"));
+        let copy_button = CopyButton::new(copy_button_id, command_text)
+            .tooltip_label("Copy Command")
+            .visible_on_hover(group.clone());
+
+        v_flex()
+            .group(group)
+            .relative()
+            .p_1p5()
+            .bg(header_bg)
+            .when(is_preview, |this| this.pt_1().children(run_command_label))
+            .child(markdown_element)
+            .child(div().absolute().top_1().right_1().child(copy_button))
     }
 
     fn render_terminal_tool_call(
         &self,
-        active_session_id: &acp::SessionId,
+        active_session_id: &acp_v2::SessionId,
         entry_ix: usize,
         terminal: &Entity<acp_thread::Terminal>,
         tool_call: &ToolCall,
         focus_handle: &FocusHandle,
-        is_subagent: bool,
+        layout: ToolCallLayout,
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         let terminal_data = terminal.read(cx);
         let working_dir = terminal_data.working_dir();
-        let command = terminal_data.command();
         let started_at = terminal_data.started_at();
 
         let tool_failed = matches!(
-            &tool_call.status,
+            tool_call.status(),
             ToolCallStatus::Rejected | ToolCallStatus::Canceled | ToolCallStatus::Failed
         );
 
-        let confirmation_options = match &tool_call.status {
-            ToolCallStatus::WaitingForConfirmation { options, .. } => Some(options),
-            _ => None,
-        };
-        let needs_confirmation = confirmation_options.is_some();
+        let permission_request = tool_call
+            .authorization_id()
+            .and_then(|id| self.thread.read(cx).permission_request(id));
+        let needs_confirmation = permission_request.is_some();
 
         let output = terminal_data.output();
         let command_finished = output.is_some()
             && !matches!(
-                tool_call.status,
+                tool_call.status(),
                 ToolCallStatus::InProgress | ToolCallStatus::Pending
             );
         let truncated_output =
@@ -5186,7 +8512,13 @@ impl ThreadView {
         let output_line_count = output.map(|output| output.content_line_count).unwrap_or(0);
 
         let command_failed = command_finished
-            && output.is_some_and(|o| o.exit_status.is_some_and(|status| !status.success()));
+            && output.is_some_and(|output| {
+                output
+                    .exit_status
+                    .exit_code
+                    .is_some_and(|exit_code| exit_code != 0)
+                    || output.exit_status.signal.is_some()
+            });
 
         let time_elapsed = if let Some(output) = output {
             output.ended_at.duration_since(started_at)
@@ -5194,17 +8526,10 @@ impl ThreadView {
             started_at.elapsed()
         };
 
-        let header_id =
-            SharedString::from(format!("terminal-tool-header-{}", terminal.entity_id()));
         let header_group = SharedString::from(format!(
             "terminal-tool-header-group-{}",
             terminal.entity_id()
         ));
-        let header_bg = cx
-            .theme()
-            .colors()
-            .element_background
-            .blend(cx.theme().colors().editor_foreground.opacity(0.025));
         let border_color = cx.theme().colors().border.opacity(0.6);
 
         let working_dir = working_dir
@@ -5212,163 +8537,81 @@ impl ThreadView {
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "current directory".to_string());
 
-        // Since the command's source is wrapped in a markdown code block
-        // (```\n...\n```), we need to strip that so we're left with only the
-        // command's content.
-        let command_source = command.read(cx).source();
-        let command_content = command_source
-            .strip_prefix("```\n")
-            .and_then(|s| s.strip_suffix("\n```"))
-            .unwrap_or(&command_source);
+        let command_element = self.render_collapsible_command(
+            header_group.clone(),
+            false,
+            tool_call.label.clone(),
+            window,
+            cx,
+        );
 
-        let command_element =
-            self.render_collapsible_command(header_group.clone(), false, command_content, cx);
+        let is_expanded = self
+            .entry_view_state
+            .read(cx)
+            .is_tool_call_expanded(&tool_call.id);
 
-        let is_expanded = self.expanded_tool_calls.contains(&tool_call.id);
-
-        let header = h_flex()
-            .id(header_id)
-            .pt_1()
-            .pl_1p5()
-            .pr_1()
-            .flex_none()
-            .gap_1()
-            .justify_between()
-            .rounded_t_md()
-            .child(
-                div()
-                    .id(("command-target-path", terminal.entity_id()))
-                    .w_full()
-                    .max_w_full()
-                    .overflow_x_scroll()
-                    .child(
-                        Label::new(working_dir)
-                            .buffer_font(cx)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            )
-            .child(
-                Disclosure::new(
-                    SharedString::from(format!(
-                        "terminal-tool-disclosure-{}",
-                        terminal.entity_id()
-                    )),
-                    is_expanded,
-                )
-                .opened_icon(IconName::ChevronUp)
-                .closed_icon(IconName::ChevronDown)
-                .visible_on_hover(&header_group)
-                .on_click(cx.listener({
-                    let id = tool_call.id.clone();
-                    move |this, _event, _window, cx| {
-                        if is_expanded {
-                            this.expanded_tool_calls.remove(&id);
-                        } else {
-                            this.expanded_tool_calls.insert(id.clone());
-                        }
-                        cx.notify();
-                    }
-                })),
-            )
-            .when(time_elapsed > Duration::from_secs(10), |header| {
-                header.child(
-                    Label::new(format!("({})", duration_alt_display(time_elapsed)))
-                        .buffer_font(cx)
-                        .color(Color::Muted)
-                        .size(LabelSize::XSmall),
-                )
-            })
-            .when(!command_finished && !needs_confirmation, |header| {
-                header
-                    .gap_1p5()
-                    .child(
-                        Icon::new(IconName::ArrowCircle)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted)
-                            .with_rotate_animation(2)
+        let truncated_tooltip = truncated_output.then(|| {
+            if let Some(output) = output {
+                if output_line_count + 10 > terminal::MAX_SCROLL_HISTORY_LINES {
+                    format!(
+                        "Output exceeded terminal max lines and was \
+                         truncated, the model received the first {}.",
+                        format_file_size(output.content.len() as u64, true)
                     )
-                    .child(div().h(relative(0.6)).ml_1p5().child(Divider::vertical().color(DividerColor::Border)))
-                    .child(
-                        IconButton::new(
-                            SharedString::from(format!("stop-terminal-{}", terminal.entity_id())),
-                            IconName::Stop
-                        )
-                        .icon_size(IconSize::Small)
-                        .icon_color(Color::Error)
-                        .tooltip(move |_window, cx| {
-                            Tooltip::with_meta(
-                                "Stop This Command",
-                                None,
-                                "Also possible by placing your cursor inside the terminal and using regular terminal bindings.",
-                                cx,
-                            )
-                        })
-                        .on_click({
-                            let terminal = terminal.clone();
-                            cx.listener(move |this, _event, _window, cx| {
-                                terminal.update(cx, |terminal, cx| {
-                                    terminal.stop_by_user(cx);
-                                });
-                                if AgentSettings::get_global(cx).cancel_generation_on_terminal_stop {
-                                    this.cancel_generation(cx);
-                                }
-                            })
-                        }),
-                    )
-            })
-            .when(truncated_output, |header| {
-                let tooltip = if let Some(output) = output {
-                    if output_line_count + 10 > terminal::MAX_SCROLL_HISTORY_LINES {
-                       format!("Output exceeded terminal max lines and was \
-                            truncated, the model received the first {}.", format_file_size(output.content.len() as u64, true))
-                    } else {
-                        format!(
-                            "Output is {} long, and to avoid unexpected token usage, \
-                                only {} was sent back to the agent.",
-                            format_file_size(output.original_content_len as u64, true),
-                             format_file_size(output.content.len() as u64, true)
-                        )
-                    }
                 } else {
-                    "Output was truncated".to_string()
-                };
+                    format!(
+                        "Output is {} long, and to avoid unexpected token usage, \
+                         only {} was sent back to the agent.",
+                        format_file_size(output.original_content_len as u64, true),
+                        format_file_size(output.content.len() as u64, true)
+                    )
+                }
+            } else {
+                "Output was truncated".to_string()
+            }
+        });
 
-                header.child(
-                    h_flex()
-                        .id(("terminal-tool-truncated-label", terminal.entity_id()))
-                        .gap_1()
-                        .child(
-                            Icon::new(IconName::Info)
-                                .size(IconSize::XSmall)
-                                .color(Color::Ignored),
-                        )
-                        .child(
-                            Label::new("Truncated")
-                                .color(Color::Muted)
-                                .size(LabelSize::XSmall),
-                        )
-                        .tooltip(Tooltip::text(tooltip)),
-                )
+        let header = TerminalToolHeader::new(
+            terminal.entity_id().to_string(),
+            header_group,
+            working_dir,
+            is_expanded,
+        )
+        .elapsed(time_elapsed)
+        .running(!command_finished && !needs_confirmation)
+        .on_toggle_expand(cx.listener({
+            let id = tool_call.id.clone();
+            move |this, _event, window, cx| {
+                this.entry_view_state.update(cx, |state, _cx| {
+                    state.toggle_tool_call_expansion(&id);
+                });
+                this.refresh_thread_search(window, cx);
+                cx.notify();
+            }
+        }))
+        .when(terminal_data.is_process_backed(), |header| {
+            header.on_stop({
+                let terminal = terminal.clone();
+                cx.listener(move |this, _event, _window, cx| {
+                    terminal.update(cx, |terminal, cx| {
+                        terminal.stop_by_user(cx);
+                    });
+                    if AgentSettings::get_global(cx).cancel_generation_on_terminal_stop {
+                        this.cancel_generation(cx);
+                    }
+                })
             })
-            .when(tool_failed || command_failed, |header| {
-                header.child(
-                    div()
-                        .id(("terminal-tool-error-code-indicator", terminal.entity_id()))
-                        .child(
-                            Icon::new(IconName::Close)
-                                .size(IconSize::Small)
-                                .color(Color::Error),
-                        )
-                        .when_some(output.and_then(|o| o.exit_status), |this, status| {
-                            this.tooltip(Tooltip::text(format!(
-                                "Exited with code {}",
-                                status.code().unwrap_or(-1),
-                            )))
-                        }),
-                )
-            })
-;
+        })
+        .when_some(truncated_tooltip, |header, tooltip| {
+            header.truncated(tooltip)
+        })
+        .when(tool_failed || command_failed, |header| {
+            header.failed(output.and_then(|output| output.exit_status.exit_code))
+        })
+        .when_some(tool_call.sandbox_not_applied.as_ref(), |header, reason| {
+            header.sandbox_warning(self.sandbox_not_applied_warning(reason, cx))
+        })
+        .command_slot(command_element);
 
         let terminal_view = self
             .entry_view_state
@@ -5377,7 +8620,7 @@ impl ThreadView {
             .and_then(|entry| entry.terminal(terminal));
 
         v_flex()
-            .when(!is_subagent, |this| {
+            .when(layout == ToolCallLayout::Standalone, |this| {
                 this.my_1p5()
                     .mx_5()
                     .border_1()
@@ -5386,14 +8629,7 @@ impl ThreadView {
                     .rounded_md()
             })
             .overflow_hidden()
-            .child(
-                v_flex()
-                    .group(&header_group)
-                    .bg(header_bg)
-                    .text_xs()
-                    .child(header)
-                    .child(command_element),
-            )
+            .child(header)
             .when(is_expanded && terminal_view.is_some(), |this| {
                 this.child(
                     div()
@@ -5401,7 +8637,7 @@ impl ThreadView {
                         .border_t_1()
                         .when(tool_failed || command_failed, |card| card.border_dashed())
                         .border_color(border_color)
-                        .bg(cx.theme().colors().editor_background)
+                        .bg(cx.theme().colors().terminal_background)
                         .rounded_b_md()
                         .text_ui_sm(cx)
                         .h_full()
@@ -5426,48 +8662,117 @@ impl ThreadView {
                         })),
                 )
             })
-            .when_some(confirmation_options, |this, options| {
+            .when_some(permission_request, |this, request| {
                 let is_first = self.is_first_tool_call(active_session_id, &tool_call.id, cx);
+                let allow_disabled = self.sandbox_confusables_block_allow(tool_call, cx);
                 this.child(self.render_permission_buttons(
-                    self.id.clone(),
+                    self.thread.read(cx).session_id().clone(),
                     is_first,
-                    options,
+                    request,
                     entry_ix,
-                    tool_call.id.clone(),
                     focus_handle,
+                    allow_disabled,
                     cx,
                 ))
             })
             .into_any()
     }
 
+    fn sandbox_not_applied_warning(
+        &self,
+        reason: &SandboxNotAppliedReason,
+        cx: &Context<Self>,
+    ) -> TerminalSandboxWarning {
+        // (title, detail line, docs section slug)
+        let (title, detail, docs_section): (SharedString, SharedString, Option<&'static str>) =
+            match reason {
+                SandboxNotAppliedReason::ErrorLinuxWsl(error) => (
+                    "Couldn't create a sandbox".into(),
+                    error.user_facing_message().into(),
+                    Some(error.docs_section()),
+                ),
+                SandboxNotAppliedReason::DisabledForThisThread => {
+                    // The grant only exists because an earlier command failed to
+                    // create a sandbox; surface that same explanation here.
+                    let thread_error = self.find_thread_sandbox_error(cx);
+                    let detail = thread_error
+                        .as_ref()
+                        .map(|error| {
+                            SharedString::from(format!(
+                                "Allowed for this thread after the sandbox failed: {}",
+                                error.user_facing_message()
+                            ))
+                        })
+                        .unwrap_or_else(|| {
+                            "Unsandboxed execution is allowed for the rest of this thread.".into()
+                        });
+                    let docs_section = thread_error.as_ref().map(|error| error.docs_section());
+                    ("Ran without sandbox".into(), detail, docs_section)
+                }
+            };
+
+        TerminalSandboxWarning {
+            title,
+            detail,
+            docs_url: zed_urls::sandboxing_docs(docs_section, cx).into(),
+        }
+    }
+
+    /// Find the first terminal tool call in the thread whose sandbox couldn't be
+    /// created, so a later "disabled for this thread" warning can reuse the same
+    /// explanation of *why* the sandbox failed.
+    fn find_thread_sandbox_error(&self, cx: &App) -> Option<acp_thread::LinuxWslSandboxError> {
+        self.thread.read(cx).entries().iter().find_map(|entry| {
+            if let AgentThreadEntry::ToolCall(tool_call) = entry
+                && let Some(SandboxNotAppliedReason::ErrorLinuxWsl(error)) =
+                    &tool_call.sandbox_not_applied
+            {
+                return Some(error.clone());
+            }
+            None
+        })
+    }
+
     fn is_first_tool_call(
         &self,
-        active_session_id: &acp::SessionId,
-        tool_call_id: &acp::ToolCallId,
+        active_session_id: &acp_v2::SessionId,
+        tool_call_id: &acp_v2::ToolCallId,
         cx: &App,
     ) -> bool {
         self.conversation
             .read(cx)
             .pending_tool_call(active_session_id, cx)
             .map_or(false, |(pending_session_id, pending_tool_call_id, _)| {
-                self.id == pending_session_id && tool_call_id == &pending_tool_call_id
+                self.thread.read(cx).session_id() == &pending_session_id
+                    && tool_call_id == &pending_tool_call_id
             })
     }
 
     fn render_any_tool_call(
         &self,
-        active_session_id: &acp::SessionId,
+        active_session_id: &acp_v2::SessionId,
         entry_ix: usize,
         tool_call: &ToolCall,
         focus_handle: &FocusHandle,
-        is_subagent: bool,
+        layout: ToolCallLayout,
         window: &Window,
         cx: &Context<Self>,
-    ) -> Div {
+    ) -> Stateful<Div> {
         let has_terminals = tool_call.terminals().next().is_some();
 
-        div().w_full().map(|this| {
+        // Give every tool-call subtree a unique element-id prefix derived from
+        // the globally-unique tool call id and the layout. This single wrapper
+        // is what keeps all the `entry_ix`-keyed element ids inside the card
+        // collision-free, even when the same tool call is rendered in multiple
+        // places at once (inline list + floating awaiting-permission row) or
+        // when subagent entries are inlined into the parent view's element tree.
+        let container_id = ElementId::Name(SharedString::from(format!(
+            "tool-call-{}-{}",
+            tool_call.id.0,
+            layout.id_str()
+        )));
+
+        div().w_full().id(container_id).map(|this| {
             if tool_call.is_subagent() {
                 this.child(
                     self.render_subagent_tool_call(
@@ -5491,7 +8796,7 @@ impl ThreadView {
                         terminal,
                         tool_call,
                         focus_handle,
-                        is_subagent,
+                        layout,
                         window,
                         cx,
                     )
@@ -5502,7 +8807,7 @@ impl ThreadView {
                     entry_ix,
                     tool_call,
                     focus_handle,
-                    is_subagent,
+                    layout,
                     window,
                     cx,
                 ))
@@ -5512,33 +8817,35 @@ impl ThreadView {
 
     fn render_tool_call(
         &self,
-        active_session_id: &acp::SessionId,
+        active_session_id: &acp_v2::SessionId,
         entry_ix: usize,
         tool_call: &ToolCall,
         focus_handle: &FocusHandle,
-        is_subagent: bool,
+        layout: ToolCallLayout,
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
         let has_location = tool_call.locations.len() == 1;
-        let card_header_id = SharedString::from("inner-tool-call-header");
+        let card_header_id = SharedString::from(format!("inner-tool-call-header-{entry_ix}"));
 
-        let failed_or_canceled = match &tool_call.status {
+        let failed_or_canceled = match tool_call.status() {
             ToolCallStatus::Rejected | ToolCallStatus::Canceled | ToolCallStatus::Failed => true,
             _ => false,
         };
 
-        let needs_confirmation = matches!(
-            tool_call.status,
-            ToolCallStatus::WaitingForConfirmation { .. }
-        );
-        let is_terminal_tool = matches!(tool_call.kind, acp::ToolKind::Execute);
+        let needs_confirmation =
+            matches!(tool_call.status(), ToolCallStatus::WaitingForConfirmation);
+        let is_terminal_tool = matches!(tool_call.kind(), acp_v2::ToolKind::Execute);
 
-        let is_edit =
-            matches!(tool_call.kind, acp::ToolKind::Edit) || tool_call.diffs().next().is_some();
+        let is_edit = matches!(tool_call.kind(), acp_v2::ToolKind::Edit)
+            || tool_call.diffs().next().is_some()
+            || tool_call
+                .content()
+                .iter()
+                .any(|content| matches!(content, ToolCallContent::DiffPatch { .. }));
 
-        let is_cancelled_edit = is_edit && matches!(tool_call.status, ToolCallStatus::Canceled);
-        let (has_revealed_diff, tool_call_output_focus) = tool_call
+        let is_cancelled_edit = is_edit && matches!(tool_call.status(), ToolCallStatus::Canceled);
+        let (has_revealed_diff, tool_call_output_focus, tool_call_output_focus_handle) = tool_call
             .diffs()
             .next()
             .and_then(|diff| {
@@ -5549,19 +8856,25 @@ impl ThreadView {
                     .and_then(|entry| entry.editor_for_diff(diff))?;
                 let has_revealed_diff = diff.read(cx).has_revealed_range(cx);
                 let has_focus = editor.read(cx).is_focused(window);
-                Some((has_revealed_diff, has_focus))
+                let focus_handle = editor.focus_handle(cx);
+                Some((has_revealed_diff, has_focus, focus_handle))
             })
-            .unwrap_or((false, false));
+            .unwrap_or_else(|| (false, false, focus_handle.clone()));
 
         let use_card_layout = needs_confirmation || is_edit || is_terminal_tool;
 
-        let has_image_content = tool_call.content.iter().any(|c| c.image().is_some());
-        let is_collapsible = !tool_call.content.is_empty() && !needs_confirmation;
-        let mut is_open = self.expanded_tool_calls.contains(&tool_call.id);
-
-        is_open |= needs_confirmation;
+        let has_image_content = tool_call.content().iter().any(|c| c.image().is_some());
 
         let should_show_raw_input = !is_terminal_tool && !is_edit && !has_image_content;
+
+        let has_content = !tool_call.content().is_empty()
+            || (should_show_raw_input && tool_call.raw_input.is_some());
+
+        let is_collapsible = has_content && !needs_confirmation;
+        let is_open = self
+            .entry_view_state
+            .read(cx)
+            .is_tool_call_content_visible(tool_call);
 
         let input_output_header = |label: SharedString| {
             Label::new(label)
@@ -5571,15 +8884,12 @@ impl ThreadView {
         };
 
         let tool_output_display = if is_open {
-            match &tool_call.status {
-                ToolCallStatus::WaitingForConfirmation { options, .. } => v_flex()
-                    .w_full()
-                    .children(
-                        tool_call
-                            .content
-                            .iter()
-                            .enumerate()
-                            .map(|(content_ix, content)| {
+            match tool_call.status() {
+                ToolCallStatus::WaitingForConfirmation => {
+                    let confirmation_content = v_flex()
+                        .w_full()
+                        .children(tool_call.content().iter().enumerate().map(
+                            |(content_ix, content)| {
                                 div()
                                     .child(self.render_tool_call_content(
                                         active_session_id,
@@ -5588,92 +8898,108 @@ impl ThreadView {
                                         content_ix,
                                         tool_call,
                                         use_card_layout,
-                                        has_image_content,
                                         failed_or_canceled,
                                         focus_handle,
                                         window,
                                         cx,
                                     ))
                                     .into_any_element()
-                            }),
-                    )
-                    .when(should_show_raw_input, |this| {
-                        let is_raw_input_expanded =
-                            self.expanded_tool_call_raw_inputs.contains(&tool_call.id);
-
-                        let input_header = if is_raw_input_expanded {
-                            "Raw Input:"
-                        } else {
-                            "View Raw Input"
-                        };
-
-                        this.child(
-                            v_flex()
-                                .p_2()
-                                .gap_1()
-                                .border_t_1()
-                                .border_color(self.tool_card_border_color(cx))
-                                .child(
-                                    h_flex()
-                                        .id("disclosure_container")
-                                        .pl_0p5()
-                                        .gap_1()
-                                        .justify_between()
-                                        .rounded_xs()
-                                        .hover(|s| s.bg(cx.theme().colors().element_hover))
-                                        .child(input_output_header(input_header.into()))
-                                        .child(
-                                            Disclosure::new(
-                                                ("raw-input-disclosure", entry_ix),
-                                                is_raw_input_expanded,
-                                            )
-                                            .opened_icon(IconName::ChevronUp)
-                                            .closed_icon(IconName::ChevronDown),
-                                        )
-                                        .on_click(cx.listener({
-                                            let id = tool_call.id.clone();
-
-                                            move |this: &mut Self, _, _, cx| {
-                                                if this.expanded_tool_call_raw_inputs.contains(&id)
-                                                {
-                                                    this.expanded_tool_call_raw_inputs.remove(&id);
-                                                } else {
-                                                    this.expanded_tool_call_raw_inputs
-                                                        .insert(id.clone());
-                                                }
-                                                cx.notify();
-                                            }
-                                        })),
-                                )
-                                .when(is_raw_input_expanded, |this| {
-                                    this.children(tool_call.raw_input_markdown.clone().map(
-                                        |input| {
-                                            self.render_markdown(
-                                                input,
-                                                MarkdownStyle::themed(
-                                                    MarkdownFont::Agent,
-                                                    window,
-                                                    cx,
-                                                ),
-                                            )
-                                        },
-                                    ))
-                                }),
+                            },
+                        ))
+                        .when_some(
+                            tool_call.sandbox_authorization_details.as_ref(),
+                            |this, details| {
+                                this.child(self.render_sandbox_authorization_details(
+                                    entry_ix,
+                                    &tool_call.id,
+                                    details,
+                                    window,
+                                    cx,
+                                ))
+                            },
                         )
-                    })
-                    .child(self.render_permission_buttons(
-                        self.id.clone(),
-                        self.is_first_tool_call(active_session_id, &tool_call.id, cx),
-                        options,
-                        entry_ix,
-                        tool_call.id.clone(),
-                        focus_handle,
-                        cx,
-                    ))
-                    .into_any(),
+                        .when_some(
+                            tool_call.sandbox_fallback_authorization_details.as_ref(),
+                            |this, details| {
+                                this.child(
+                                    self.render_sandbox_fallback_authorization_details(details, cx),
+                                )
+                            },
+                        )
+                        .when(should_show_raw_input, |this| {
+                            let is_raw_input_expanded =
+                                self.expanded_tool_call_raw_inputs.contains(&tool_call.id);
+
+                            let input_header = if is_raw_input_expanded {
+                                "Raw Input:"
+                            } else {
+                                "View Raw Input"
+                            };
+
+                            this.child(
+                                v_flex()
+                                    .p_2()
+                                    .gap_1()
+                                    .border_t_1()
+                                    .border_color(self.tool_card_border_color(cx))
+                                    .child(
+                                        h_flex()
+                                            .id("disclosure_container")
+                                            .pl_0p5()
+                                            .gap_1()
+                                            .justify_between()
+                                            .rounded_xs()
+                                            .hover(|s| s.bg(cx.theme().colors().element_hover))
+                                            .child(input_output_header(input_header.into()))
+                                            .child(
+                                                Disclosure::new(
+                                                    ("raw-input-disclosure", entry_ix),
+                                                    is_raw_input_expanded,
+                                                )
+                                                .opened_icon(IconName::ChevronUp)
+                                                .closed_icon(IconName::ChevronDown),
+                                            )
+                                            .on_click(cx.listener({
+                                                let id = tool_call.id.clone();
+
+                                                move |this: &mut Self, _, _, cx| {
+                                                    if this
+                                                        .expanded_tool_call_raw_inputs
+                                                        .contains(&id)
+                                                    {
+                                                        this.expanded_tool_call_raw_inputs
+                                                            .remove(&id);
+                                                    } else {
+                                                        this.expanded_tool_call_raw_inputs
+                                                            .insert(id.clone());
+                                                    }
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    )
+                                    .when(is_raw_input_expanded, |this| {
+                                        this.children(tool_call.raw_input_markdown.clone().map(
+                                            |input| {
+                                                self.render_markdown(
+                                                    input,
+                                                    MarkdownStyle::themed(
+                                                        MarkdownFont::Agent,
+                                                        window,
+                                                        cx,
+                                                    ),
+                                                    cx,
+                                                )
+                                            },
+                                        ))
+                                    }),
+                            )
+                        });
+
+                    confirmation_content.into_any()
+                }
                 ToolCallStatus::Pending | ToolCallStatus::InProgress
                     if is_edit
-                        && tool_call.content.is_empty()
+                        && tool_call.content().is_empty()
                         && self.as_native_connection(cx).is_some() =>
                 {
                     self.render_diff_loading(cx)
@@ -5698,35 +9024,67 @@ impl ThreadView {
                                         self.render_markdown(
                                             input,
                                             MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                                            cx,
                                         ),
                                     )
                                 }))
                                 .child(input_output_header("Output:".into())),
                         )
                     })
-                    .children(
-                        tool_call
-                            .content
-                            .iter()
-                            .enumerate()
-                            .map(|(content_ix, content)| {
-                                div().id(("tool-call-output", entry_ix)).child(
-                                    self.render_tool_call_content(
-                                        active_session_id,
-                                        entry_ix,
-                                        content,
-                                        content_ix,
-                                        tool_call,
-                                        use_card_layout,
-                                        has_image_content,
-                                        failed_or_canceled,
-                                        focus_handle,
-                                        window,
-                                        cx,
-                                    ),
-                                )
-                            }),
-                    )
+                    .children(tool_call.content().iter().enumerate().map(
+                        |(content_ix, content)| {
+                            let output_id = SharedString::from(format!(
+                                "tool-call-output-{entry_ix}-{content_ix}"
+                            ));
+                            div()
+                                .id(output_id.clone())
+                                .debug_selector(move || output_id.to_string())
+                                .child(self.render_tool_call_content(
+                                    active_session_id,
+                                    entry_ix,
+                                    content,
+                                    content_ix,
+                                    tool_call,
+                                    use_card_layout,
+                                    failed_or_canceled,
+                                    focus_handle,
+                                    window,
+                                    cx,
+                                ))
+                        },
+                    ))
+                    .when(!use_card_layout, |this| {
+                        let button_id =
+                            SharedString::from(format!("tool_output-collapse-{:?}", tool_call.id));
+                        let tool_call_id = tool_call.id.clone();
+
+                        this.child(
+                            div()
+                                .ml(rems(0.4))
+                                .px_3p5()
+                                .pt_2()
+                                .border_l_1()
+                                .border_color(self.tool_card_border_color(cx))
+                                .child(
+                                    IconButton::new(button_id, IconName::ChevronUp)
+                                        .full_width()
+                                        .style(ButtonStyle::Outlined)
+                                        .icon_color(Color::Muted)
+                                        .on_click(cx.listener({
+                                            move |this: &mut Self,
+                                                  _,
+                                                  window,
+                                                  cx: &mut Context<Self>| {
+                                                this.entry_view_state.update(cx, |state, _cx| {
+                                                    state.collapse_tool_call(&tool_call_id);
+                                                });
+                                                this.refresh_thread_search(window, cx);
+                                                cx.notify();
+                                            }
+                                        })),
+                                ),
+                        )
+                    })
                     .into_any(),
                 ToolCallStatus::Rejected => Empty.into_any(),
             }
@@ -5735,39 +9093,31 @@ impl ThreadView {
             None
         };
 
-        v_flex()
-            .map(|this| {
-                if is_subagent {
-                    this
-                } else if use_card_layout {
-                    this.my_1p5()
-                        .rounded_md()
-                        .border_1()
-                        .when(failed_or_canceled, |this| this.border_dashed())
-                        .border_color(self.tool_card_border_color(cx))
-                        .bg(cx.theme().colors().editor_background)
-                        .overflow_hidden()
-                } else {
-                    this.my_1()
-                }
-            })
-            .when(!is_subagent, |this| {
-                this.map(|this| {
-                    if has_location && !use_card_layout {
-                        this.ml_4()
-                    } else {
-                        this.ml_5()
-                    }
-                })
-                .mr_5()
-            })
+        let permission_buttons = if let Some(request) = tool_call
+            .authorization_id()
+            .and_then(|id| self.thread.read(cx).permission_request(id))
+        {
+            Some(self.render_permission_buttons(
+                self.thread.read(cx).session_id().clone(),
+                self.is_first_tool_call(active_session_id, &tool_call.id, cx),
+                request,
+                entry_ix,
+                focus_handle,
+                self.sandbox_confusables_block_allow(tool_call, cx),
+                cx,
+            ))
+        } else {
+            None
+        };
+
+        let body = v_flex()
             .map(|this| {
                 if is_terminal_tool {
-                    let label_source = tool_call.label.read(cx).source();
                     this.child(self.render_collapsible_command(
                         card_header_id.clone(),
                         true,
-                        label_source,
+                        tool_call.label.clone(),
+                        window,
                         cx,
                     ))
                 } else {
@@ -5776,11 +9126,10 @@ impl ThreadView {
                             .group(&card_header_id)
                             .relative()
                             .w_full()
-                            .gap_1()
                             .justify_between()
                             .when(use_card_layout, |this| {
                                 this.p_0p5()
-                                    .rounded_t(rems_from_px(5.))
+                                    .rounded_t(rems_from_px(5_f32))
                                     .bg(self.tool_card_header_bg(cx))
                             })
                             .child(self.render_tool_call_label(
@@ -5795,11 +9144,9 @@ impl ThreadView {
                             ))
                             .child(
                                 h_flex()
-                                    .gap_0p5()
                                     .when(is_collapsible || failed_or_canceled, |this| {
                                         let diff_for_discard = if has_revealed_diff
                                             && is_cancelled_edit
-                                            && cx.has_flag::<AgentV2FeatureFlag>()
                                         {
                                             tool_call.diffs().next().cloned()
                                         } else {
@@ -5808,10 +9155,7 @@ impl ThreadView {
 
                                         this.child(
                                             h_flex()
-                                                .px_1()
-                                                .when_some(diff_for_discard.clone(), |this, _| {
-                                                    this.pr_0p5()
-                                                })
+                                                .pr_0p5()
                                                 .gap_1()
                                                 .when(is_collapsible, |this| {
                                                     this.child(
@@ -5826,15 +9170,18 @@ impl ThreadView {
                                                             let id = tool_call.id.clone();
                                                             move |this: &mut Self,
                                                                   _,
-                                                                  _,
+                                                                  window,
                                                                   cx: &mut Context<Self>| {
-                                                                if is_open {
-                                                                    this.expanded_tool_calls
-                                                                        .remove(&id);
-                                                                } else {
-                                                                    this.expanded_tool_calls
-                                                                        .insert(id.clone());
-                                                                }
+                                                                this.entry_view_state.update(
+                                                                    cx,
+                                                                    |state, _cx| {
+                                                                        state
+                                                                            .toggle_tool_call_expansion(
+                                                                                &id,
+                                                                            );
+                                                                    },
+                                                                );
+                                                                this.refresh_thread_search(window, cx);
                                                                 cx.notify();
                                                             }
                                                         })),
@@ -5919,11 +9266,11 @@ impl ThreadView {
                                     .when(tool_call_output_focus, |this| {
                                         this.child(
                                             Button::new("open-file-button", "Open File")
+                                                .style(ButtonStyle::Outlined)
                                                 .label_size(LabelSize::Small)
-                                                .style(ButtonStyle::OutlinedGhost)
                                                 .key_binding(
-                                                    KeyBinding::for_action(&OpenExcerpts, cx)
-                                                        .map(|s| s.size(rems_from_px(12.))),
+                                                    KeyBinding::for_action_in(&OpenExcerpts, &tool_call_output_focus_handle, cx)
+                                                        .map(|s| s.size(rems_from_px(12_f32))),
                                                 )
                                                 .on_click(|_, window, cx| {
                                                     window.dispatch_action(
@@ -5938,27 +9285,761 @@ impl ThreadView {
                     )
                 }
             })
-            .children(tool_output_display)
+            .children(tool_output_display);
+
+        v_flex()
+            .map(|this| {
+                if matches!(layout, ToolCallLayout::Embedded | ToolCallLayout::Floating) {
+                    this
+                } else if use_card_layout {
+                    this.my_1p5()
+                        .rounded_md()
+                        .border_1()
+                        .when(failed_or_canceled, |this| this.border_dashed())
+                        .border_color(self.tool_card_border_color(cx))
+                        .bg(cx.theme().colors().editor_background)
+                        .overflow_hidden()
+                } else {
+                    this.my_1()
+                }
+            })
+            .when(layout == ToolCallLayout::Standalone, |this| {
+                this.map(|this| {
+                    if has_location && !use_card_layout {
+                        this.ml_4()
+                    } else {
+                        this.ml_5()
+                    }
+                })
+                .mr_5()
+            })
+            .map(|this| {
+                if layout == ToolCallLayout::Floating {
+                    this.child(
+                        div()
+                            .id(("floating-tool-call-body", entry_ix))
+                            .max_h_40()
+                            .overflow_y_scroll()
+                            .child(body),
+                    )
+                } else {
+                    this.child(body)
+                }
+            })
+            .children(permission_buttons)
+    }
+
+    /// A small "Learn more" link to the sandboxing docs, deep-linked to
+    /// `section` when provided. Shared by the sandbox warning and the two
+    /// sandbox approval prompts so the user can always reach an explanation of
+    /// what they're being asked about.
+    fn render_sandbox_docs_link(
+        &self,
+        id: &'static str,
+        section: Option<&str>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let url = zed_urls::sandboxing_docs(section, cx);
+
+        Button::new(id, "View Sandboxing Docs")
+            .label_size(LabelSize::Small)
+            .color(Color::Muted)
+            .end_icon(
+                Icon::new(IconName::ArrowUpRight)
+                    .color(Color::Muted)
+                    .size(IconSize::XSmall),
+            )
+            .tooltip({
+                let url = url.clone();
+                move |_, cx| Tooltip::with_meta("Open Docs", None, url.clone(), cx)
+            })
+            .on_click(move |_, _, cx| cx.open_url(&url))
+            .into_any_element()
+    }
+
+    fn render_sandbox_authorization_details(
+        &self,
+        entry_ix: usize,
+        tool_call_id: &acp_v2::ToolCallId,
+        details: &SandboxAuthorizationDetails,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let has_network = details.network_all_hosts || !details.network_hosts.is_empty();
+        let has_write = details.allow_fs_write_all || !details.write_paths.is_empty();
+        // The dedicated Windows-drive warning prompt is only ever sent while the
+        // warning is enabled, so key the banner on the prompt itself. Keeping it
+        // visible even after the "Don't show again" checkbox flips the setting
+        // avoids the card disappearing out from under the user mid-decision.
+        let has_windows_fs_warning = details.warn_windows_fs;
+        if !has_network
+            && !has_write
+            && !details.unsandboxed
+            && details.reason.is_empty()
+            && !has_windows_fs_warning
+        {
+            return Empty.into_any_element();
+        }
+
+        let confusable_findings = if Self::confusable_warning_enabled(cx) {
+            Self::sandbox_confusable_findings(details)
+        } else {
+            Vec::new()
+        };
+
+        let network_section = has_network.then(|| {
+            let summary = if details.network_all_hosts {
+                "any host".to_string()
+            } else {
+                format!(
+                    "{} {}",
+                    details.network_hosts.len(),
+                    if details.network_hosts.len() == 1 {
+                        "host"
+                    } else {
+                        "hosts"
+                    }
+                )
+            };
+            let has_host_list = !details.network_all_hosts && !details.network_hosts.is_empty();
+            let is_open = !self
+                .collapsed_sandbox_network_details
+                .contains(tool_call_id);
+            let mut hosts = details.network_hosts.clone();
+            hosts.sort();
+
+            v_flex()
+                .child(
+                    h_flex()
+                        .id(("sandbox-network-details-header", entry_ix))
+                        // Align text with the allow/deny button icons below,
+                        // which sit at p_1 (container) + Base04 (button) ≈ px_2.
+                        .px_2()
+                        .py_1()
+                        .justify_between()
+                        .when(has_host_list, |this| {
+                            this.cursor_pointer()
+                                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                .on_click(cx.listener({
+                                    let tool_call_id = tool_call_id.clone();
+                                    move |this, _event, _window, cx| {
+                                        if this
+                                            .collapsed_sandbox_network_details
+                                            .remove(&tool_call_id)
+                                        {
+                                            cx.notify();
+                                            return;
+                                        }
+
+                                        this.collapsed_sandbox_network_details
+                                            .insert(tool_call_id.clone());
+                                        cx.notify();
+                                    }
+                                }))
+                        })
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Label::new("Network access")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new("•")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Disabled),
+                                )
+                                .child(
+                                    Label::new(summary)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .when(has_host_list, |this| {
+                            this.child(
+                                Disclosure::new(("sandbox-network-details", entry_ix), is_open)
+                                    .opened_icon(IconName::ChevronUp)
+                                    .closed_icon(IconName::ChevronDown),
+                            )
+                        }),
+                )
+                .when(has_host_list && is_open, |this| {
+                    this.child(v_flex().children(hosts.iter().enumerate().map(
+                        |(host_ix, host)| {
+                            h_flex()
+                                .min_w_0()
+                                .px_2()
+                                .py_1p5()
+                                .bg(cx.theme().colors().editor_background)
+                                .when(host_ix < hosts.len() - 1, |this| {
+                                    this.border_b_1().border_color(cx.theme().colors().border)
+                                })
+                                .child(
+                                    Label::new(host.clone())
+                                        .size(LabelSize::XSmall)
+                                        .buffer_font(cx),
+                                )
+                        },
+                    )))
+                })
+        });
+
+        let write_section = has_write.then(|| {
+            let summary = if details.allow_fs_write_all {
+                "unrestricted except Git metadata".to_string()
+            } else {
+                format!(
+                    "{} {}",
+                    details.write_paths.len(),
+                    if details.write_paths.len() == 1 {
+                        "path"
+                    } else {
+                        "paths"
+                    }
+                )
+            };
+            let has_path_list = !details.allow_fs_write_all && !details.write_paths.is_empty();
+            let is_open = !self
+                .collapsed_sandbox_authorization_details
+                .contains(tool_call_id);
+            let mut paths = details.write_paths.clone();
+            // Sort by the path that is actually granted (the resolved canonical
+            // when present, else the requested path).
+            paths.sort_by(|a, b| a.canonical_or_requested().cmp(b.canonical_or_requested()));
+
+            v_flex()
+                .child(
+                    h_flex()
+                        .id(("sandbox-authorization-details-header", entry_ix))
+                        .px_2()
+                        .py_1()
+                        .justify_between()
+                        .when(has_path_list, |this| {
+                            this.cursor_pointer()
+                                .hover(|style| style.bg(cx.theme().colors().element_hover))
+                                .on_click(cx.listener({
+                                    let tool_call_id = tool_call_id.clone();
+                                    move |this, _event, _window, cx| {
+                                        if this
+                                            .collapsed_sandbox_authorization_details
+                                            .remove(&tool_call_id)
+                                        {
+                                            cx.notify();
+                                            return;
+                                        }
+
+                                        this.collapsed_sandbox_authorization_details
+                                            .insert(tool_call_id.clone());
+                                        cx.notify();
+                                    }
+                                }))
+                        })
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Label::new("Write Access")
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new("•")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Disabled),
+                                )
+                                .child(
+                                    Label::new(summary)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                        .when(has_path_list, |this| {
+                            this.child(
+                                Disclosure::new(
+                                    ("sandbox-authorization-details", entry_ix),
+                                    is_open,
+                                )
+                                .opened_icon(IconName::ChevronUp)
+                                .closed_icon(IconName::ChevronDown),
+                            )
+                        }),
+                )
+                .when(has_path_list && is_open, |this| {
+                    this.child(v_flex().children(paths.iter().enumerate().map(
+                        |(path_ix, path)| {
+                            self.render_sandbox_authorization_path_row(entry_ix, path_ix, path, cx)
+                        },
+                    )))
+                })
+        });
+
+        let unsandboxed_section = details.unsandboxed.then(|| {
+            h_flex()
+                .px_2()
+                .py_1()
+                .gap_1p5()
+                .child(
+                    Icon::new(IconName::Warning)
+                        .color(Color::Warning)
+                        .size(IconSize::Small),
+                )
+                .child(
+                    Label::new("Runs without the OS sandbox")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+        });
+
+        let reason_section = (!details.reason.is_empty()).then(|| {
+            v_flex()
+                .px_2()
+                .py_1()
+                .gap_0p5()
+                .child(
+                    Label::new("Reason")
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(Label::new(details.reason.clone()).size(LabelSize::Small))
+        });
+
+        // The command stays in the tool-call title above; here we show what the
+        // command is asking for (paths / domains) and the agent's reason.
+        v_flex()
+            .border_t_1()
+            .border_color(self.tool_card_border_color(cx))
+            .when(has_windows_fs_warning, |this| {
+                this.child(self.render_sandbox_windows_fs_warning(cx))
+            })
+            .when(!confusable_findings.is_empty(), |this| {
+                this.child(self.render_sandbox_confusable_warning(
+                    tool_call_id,
+                    &confusable_findings,
+                    window,
+                    cx,
+                ))
+            })
+            .children(network_section)
+            .children(write_section)
+            .children(unsandboxed_section)
+            .children(reason_section)
+            .when(!has_windows_fs_warning, |this| {
+                // The Windows-drive warning banner carries its own docs link, so
+                // skip the default one that every other sandbox prompt appends.
+                this.child(
+                    h_flex()
+                        .px_1()
+                        .py_0p5()
+                        .child(self.render_sandbox_docs_link(
+                            "sandbox-authorization-docs-link",
+                            None,
+                            cx,
+                        )),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Scan the hosts and paths in a sandbox escalation request for surprising
+    /// Unicode characters (homoglyphs, invisible characters, bidi overrides).
+    /// Returns, for each offending value, the display string shown to the user
+    /// and the distinct suspicious characters it contains. Hosts are decoded from
+    /// Punycode first, so the display string is the Unicode form the user should
+    /// scrutinize. Empty when nothing is surprising.
+    fn sandbox_confusable_findings(
+        details: &SandboxAuthorizationDetails,
+    ) -> Vec<(String, Vec<unicode_confusables::SuspiciousChar>)> {
+        let mut findings = Vec::new();
+        for host in &details.network_hosts {
+            let (decoded, suspicious) = unicode_confusables::scan_host(host);
+            if !suspicious.is_empty() {
+                findings.push((decoded, suspicious));
+            }
+        }
+        for granted in &details.write_paths {
+            // Scan both the requested path and the resolved target (when they
+            // differ), so a confusable in either the shown request or the real
+            // grant destination is surfaced.
+            let requested = granted.requested.display().to_string();
+            let resolved = granted.canonical_or_requested().display().to_string();
+            for display in [requested, resolved]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                let suspicious = unicode_confusables::scan(&display);
+                if !suspicious.is_empty() {
+                    findings.push((display, suspicious));
+                }
+            }
+        }
+        findings
+    }
+
+    /// Whether the surprising-Unicode warning is enabled in settings (on by
+    /// default). When off, prompts neither show the banner nor gate their allow
+    /// buttons on it.
+    fn confusable_warning_enabled(cx: &App) -> bool {
+        AgentSettings::get_global(cx)
+            .sandbox_permissions
+            .warn_confusable_unicode
+    }
+
+    /// Whether this tool call's sandbox escalation shows surprising Unicode that
+    /// the user hasn't acknowledged yet. While true, the prompt's allow buttons
+    /// stay disabled so the user can't grant access to a lookalike target
+    /// without first ticking the acknowledgement checkbox.
+    fn sandbox_confusables_block_allow(&self, tool_call: &ToolCall, cx: &App) -> bool {
+        if !Self::confusable_warning_enabled(cx) {
+            return false;
+        }
+        let Some(details) = tool_call.sandbox_authorization_details.as_ref() else {
+            return false;
+        };
+        if self
+            .acknowledged_confusable_warnings
+            .contains(&tool_call.id)
+        {
+            return false;
+        }
+        !Self::sandbox_confusable_findings(details).is_empty()
+    }
+
+    /// Red banner warning that a requested domain or path contains surprising
+    /// Unicode characters, with a checkbox the user must tick to unlock the
+    /// allow buttons. See [`Self::sandbox_confusables_block_allow`].
+    fn render_sandbox_confusable_warning(
+        &self,
+        tool_call_id: &acp_v2::ToolCallId,
+        findings: &[(String, Vec<unicode_confusables::SuspiciousChar>)],
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let acknowledged = self.acknowledged_confusable_warnings.contains(tool_call_id);
+        let line_height = window.line_height();
+
+        v_flex()
+            .w_full()
+            .p_2()
+            .gap_2()
+            .border_t_1()
+            .border_color(cx.theme().status().error_border)
+            .bg(cx.theme().status().error_background.opacity(0.15))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1p5()
+                    .items_start()
+                    .child(
+                        h_flex()
+                            .h(line_height)
+                            .flex_none()
+                            .justify_center()
+                            .child(
+                                Icon::new(IconName::Warning)
+                                    .size(IconSize::Small)
+                                    .color(Color::Error),
+                            ),
+                    )
+                    .child(
+                        v_flex().min_w_0().flex_1().gap_1().children(findings.iter().map(
+                            |(value, suspicious)| {
+                                v_flex()
+                                    .min_w_0()
+                                    .gap_0p5()
+                                    .child(
+                                        Label::new(format!(
+                                            "“{value}” contains potentially surprising Unicode characters"
+                                        ))
+                                        .size(LabelSize::Small)
+                                        .color(Color::Error),
+                                    )
+                                    .child(v_flex().min_w_0().pl_2().children(
+                                        suspicious.iter().map(|character| {
+                                            Label::new(format!("• {}", character.description()))
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Muted)
+                                                .buffer_font(cx)
+                                        }),
+                                    ))
+                            },
+                        )),
+                    )
+                    .child(
+                        IconButton::new("configure-confusable-warning", IconName::Settings)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Configure unicode confusables warning"))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(zed_actions::OpenSettingsAt {
+                                        path: zed_actions::AGENT_SANDBOX_SETTINGS_PATH.to_string(),
+                                        target: None,
+                                    }),
+                                    cx,
+                                );
+                            }),
+                    ),
+            )
+            .child(
+                Checkbox::new(
+                    SharedString::from(format!("confusable-ack-{}", tool_call_id.0)),
+                    if acknowledged {
+                        ToggleState::Selected
+                    } else {
+                        ToggleState::Unselected
+                    },
+                )
+                .label("I understand and wish to proceed")
+                .label_size(LabelSize::Small)
+                .on_click(cx.listener({
+                    let tool_call_id = tool_call_id.clone();
+                    move |this, state: &ToggleState, _window, cx| {
+                        if *state == ToggleState::Selected {
+                            this.acknowledged_confusable_warnings
+                                .insert(tool_call_id.clone());
+                        } else {
+                            this.acknowledged_confusable_warnings.remove(&tool_call_id);
+                        }
+                        cx.notify();
+                    }
+                })),
+            )
+            .into_any_element()
+    }
+
+    /// Whether the Windows-drive (DrvFs) weaker-guarantee warning is enabled in
+    /// settings (on by default). Windows-only in effect: `warn_windows_fs` is
+    /// never set on other platforms.
+    fn ntfs_warning_enabled(cx: &App) -> bool {
+        AgentSettings::get_global(cx)
+            .sandbox_permissions
+            .warn_ntfs_grants
+    }
+
+    /// Informational banner shown on a sandbox approval prompt when the command
+    /// will write to a file on a Windows drive (reached inside WSL via DrvFs),
+    /// whose sandbox-integrity guarantees are weaker than the distro's native
+    /// filesystem. Unlike the confusable-Unicode banner this does not gate the
+    /// allow buttons: the approval itself is the acknowledgement. A settings gear
+    /// links to where the warning can be suppressed.
+    fn render_sandbox_windows_fs_warning(&self, cx: &Context<Self>) -> AnyElement {
+        v_flex()
+            .w_full()
+            .p_2()
+            .gap_1()
+            .border_t_1()
+            .border_color(cx.theme().status().warning_border)
+            .bg(cx.theme().status().warning_background.opacity(0.15))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1p5()
+                    .items_start()
+                    .child(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::Small)
+                            .color(Color::Warning),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .gap_0p5()
+                            .child(
+                                Label::new("This command can write to a file on a Windows drive")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Warning),
+                            )
+                            .child(
+                                Label::new(
+                                    "Sandboxes with write access to a location on a Windows \
+                                     drive may not provide full filesystem isolation.",
+                                )
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                            )
+                            .child(h_flex().child(self.render_sandbox_docs_link(
+                                "sandbox-windows-fs-docs-link",
+                                Some("windows"),
+                                cx,
+                            ))),
+                    )
+                    .child(
+                        IconButton::new("configure-ntfs-warning", IconName::Settings)
+                            .icon_size(IconSize::Small)
+                            .icon_color(Color::Muted)
+                            .tooltip(Tooltip::text("Configure Windows-drive warning"))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(zed_actions::OpenSettingsAt {
+                                        path: zed_actions::AGENT_SANDBOX_SETTINGS_PATH.to_string(),
+                                        target: None,
+                                    }),
+                                    cx,
+                                );
+                            }),
+                    ),
+            )
+            .child(
+                Checkbox::new(
+                    "sandbox-windows-fs-dont-warn",
+                    if Self::ntfs_warning_enabled(cx) {
+                        ToggleState::Unselected
+                    } else {
+                        ToggleState::Selected
+                    },
+                )
+                .label("Don't show this warning again")
+                .label_size(LabelSize::Small)
+                .on_click(cx.listener(|this, state: &ToggleState, _window, cx| {
+                    let disable = *state == ToggleState::Selected;
+                    let fs = this.thread.read(cx).project().read(cx).fs().clone();
+                    update_settings_file(fs, cx, move |settings, _| {
+                        settings
+                            .agent
+                            .get_or_insert_default()
+                            .sandbox_permissions
+                            .get_or_insert_default()
+                            .warn_ntfs_grants = Some(!disable);
+                    });
+                    cx.notify();
+                })),
+            )
+            .into_any_element()
+    }
+
+    fn render_sandbox_fallback_authorization_details(
+        &self,
+        details: &SandboxFallbackAuthorizationDetails,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        // The command itself is shown in the tool-call header (a collapsible
+        // command), so here we only explain *why* the sandbox couldn't be
+        // created — the user needs both to decide whether to run unsandboxed.
+        if details.reason.is_empty() {
+            return Empty.into_any_element();
+        }
+
+        h_flex()
+            .p_1p5()
+            .gap_1p5()
+            .items_start()
+            .border_t_1()
+            .border_color(self.tool_card_border_color(cx))
+            .child(
+                Icon::new(IconName::Warning)
+                    .color(Color::Warning)
+                    .size(IconSize::Small),
+            )
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        Label::new("Couldn't create a sandbox")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(details.reason.clone()).size(LabelSize::Small))
+                    .child(self.render_sandbox_docs_link(
+                        "sandbox-fallback-docs-link",
+                        details.docs_section.as_deref(),
+                        cx,
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn render_sandbox_authorization_path_row(
+        &self,
+        entry_ix: usize,
+        path_ix: usize,
+        granted: &settings::GrantedWritePath,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        // The path that is actually granted is the resolved canonical target.
+        // When the request went through a symlink to a *different* target, both
+        // paths are shown, each explicitly captioned, so it's unmistakable which
+        // string was requested and which location write access is really granted
+        // to.
+        let granted_path = granted.canonical_or_requested();
+        let requested_path = granted.requested.clone();
+        // Grants are stored in the request's own namespace (a Windows path stays
+        // `C:\...`, a WSL path stays `/...`), so a genuine symlink/junction
+        // redirect is just a plain inequality between the request and its
+        // resolved canonical.
+        let is_redirected = granted
+            .resolved
+            .as_deref()
+            .is_some_and(|resolved| resolved != requested_path.as_path());
+
+        let granted_display = granted_path.display().to_string();
+        let requested_display = requested_path.display().to_string();
+
+        let captioned_path = |caption: SharedString, path: String, cx: &Context<Self>| {
+            v_flex()
+                .min_w_0()
+                .gap_0p5()
+                .child(
+                    Label::new(caption)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(Label::new(path).size(LabelSize::Small).buffer_font(cx))
+        };
+
+        v_flex()
+            .id(format!("sandbox-authorization-path-{entry_ix}-{path_ix}"))
+            .min_w_0()
+            .gap_1()
+            .px_2()
+            .py_1p5()
+            .bg(cx.theme().colors().editor_background)
+            .map(|this| {
+                if is_redirected {
+                    this.child(captioned_path("Source".into(), requested_display, cx))
+                        .child(
+                            Icon::new(IconName::ArrowDown)
+                                .color(Color::Muted)
+                                .size(IconSize::Small),
+                        )
+                        .child(captioned_path("Target".into(), granted_display, cx))
+                } else {
+                    // Not a genuine redirect: show what the user asked for (e.g.
+                    // the `C:\...` path), not the internal Linux canonical.
+                    this.child(captioned_path("Write Path".into(), requested_display, cx))
+                }
+            })
+            .child(Divider::horizontal())
     }
 
     fn render_permission_buttons(
         &self,
-        session_id: acp::SessionId,
+        session_id: acp_v2::SessionId,
         is_first: bool,
-        options: &PermissionOptions,
+        request: &PermissionRequest,
         entry_ix: usize,
-        tool_call_id: acp::ToolCallId,
         focus_handle: &FocusHandle,
+        // When true, the "allow" choices are disabled (e.g. an unacknowledged
+        // surprising-Unicode warning is showing). "Deny"/"Retry" stay enabled.
+        allow_disabled: bool,
         cx: &Context<Self>,
     ) -> Div {
+        let (Some(options), Some(tool_call_id)) =
+            (request.legacy_options(), request.legacy_tool_call_id())
+        else {
+            return div();
+        };
         match options {
             PermissionOptions::Flat(options) => self.render_permission_buttons_flat(
                 session_id,
                 is_first,
                 options,
                 entry_ix,
-                tool_call_id,
+                request.id,
                 focus_handle,
+                allow_disabled,
                 cx,
             ),
             PermissionOptions::Dropdown(choices) => self.render_permission_buttons_with_dropdown(
@@ -5966,8 +10047,11 @@ impl ThreadView {
                 choices,
                 None,
                 entry_ix,
-                tool_call_id,
+                session_id,
+                request.id,
+                tool_call_id.clone(),
                 focus_handle,
+                allow_disabled,
                 cx,
             ),
             PermissionOptions::DropdownWithPatterns {
@@ -5979,8 +10063,11 @@ impl ThreadView {
                 choices,
                 Some((patterns, tool_name)),
                 entry_ix,
-                tool_call_id,
+                session_id,
+                request.id,
+                tool_call_id.clone(),
                 focus_handle,
+                allow_disabled,
                 cx,
             ),
         }
@@ -5992,11 +10079,18 @@ impl ThreadView {
         choices: &[PermissionOptionChoice],
         patterns: Option<(&[PermissionPattern], &str)>,
         entry_ix: usize,
-        tool_call_id: acp::ToolCallId,
+        session_id: acp_v2::SessionId,
+        request_id: PermissionRequestId,
+        tool_call_id: acp_v2::ToolCallId,
         focus_handle: &FocusHandle,
+        allow_disabled: bool,
         cx: &Context<Self>,
     ) -> Div {
-        let selection = self.permission_selections.get(&tool_call_id);
+        let selection = self
+            .conversation
+            .read(cx)
+            .permission_selections
+            .get(&request_id);
 
         let selected_index = selection
             .and_then(|s| s.choice_index())
@@ -6012,6 +10106,11 @@ impl ThreadView {
                     .map(|choice| choice.label())
                     .unwrap_or_else(|| "Only this time".into())
             };
+        let permission_buttons_selector = {
+            let session_id = session_id.clone();
+            let dropdown_label = dropdown_label.clone();
+            move || format!("PERMISSION_BUTTONS-{session_id}-{dropdown_label}")
+        };
 
         let dropdown = if let Some((pattern_list, tool_name)) = patterns {
             self.render_permission_granularity_dropdown_with_patterns(
@@ -6020,7 +10119,8 @@ impl ThreadView {
                 tool_name,
                 dropdown_label,
                 entry_ix,
-                tool_call_id.clone(),
+                session_id.clone(),
+                request_id,
                 is_first,
                 cx,
             )
@@ -6029,7 +10129,9 @@ impl ThreadView {
                 choices,
                 dropdown_label,
                 entry_ix,
-                tool_call_id.clone(),
+                session_id.clone(),
+                request_id,
+                tool_call_id,
                 selected_index,
                 is_first,
                 cx,
@@ -6038,6 +10140,7 @@ impl ThreadView {
 
         h_flex()
             .w_full()
+            .debug_selector(permission_buttons_selector)
             .p_1()
             .gap_2()
             .justify_between()
@@ -6048,25 +10151,33 @@ impl ThreadView {
                     .gap_0p5()
                     .child(
                         Button::new(("allow-btn", entry_ix), "Allow")
+                            .disabled(allow_disabled)
                             .start_icon(
                                 Icon::new(IconName::Check)
                                     .size(IconSize::XSmall)
                                     .color(Color::Success),
                             )
                             .label_size(LabelSize::Small)
-                            .when(is_first, |this| {
+                            .when(is_first && !allow_disabled, |this| {
                                 this.key_binding(
                                     KeyBinding::for_action_in(
                                         &AllowOnce as &dyn Action,
                                         focus_handle,
                                         cx,
                                     )
-                                    .map(|kb| kb.size(rems_from_px(10.))),
+                                    .map(|kb| kb.size(rems_from_px(12_f32))),
                                 )
                             })
                             .on_click(cx.listener({
+                                let session_id = session_id.clone();
                                 move |this, _, window, cx| {
-                                    this.authorize_pending_with_granularity(true, window, cx);
+                                    this.authorize_with_granularity(
+                                        session_id.clone(),
+                                        request_id,
+                                        true,
+                                        window,
+                                        cx,
+                                    );
                                 }
                             })),
                     )
@@ -6085,12 +10196,18 @@ impl ThreadView {
                                         focus_handle,
                                         cx,
                                     )
-                                    .map(|kb| kb.size(rems_from_px(10.))),
+                                    .map(|kb| kb.size(rems_from_px(12_f32))),
                                 )
                             })
                             .on_click(cx.listener({
                                 move |this, _, window, cx| {
-                                    this.authorize_pending_with_granularity(false, window, cx);
+                                    this.authorize_with_granularity(
+                                        session_id.clone(),
+                                        request_id,
+                                        false,
+                                        window,
+                                        cx,
+                                    );
                                 }
                             })),
                     ),
@@ -6103,7 +10220,9 @@ impl ThreadView {
         choices: &[PermissionOptionChoice],
         current_label: SharedString,
         entry_ix: usize,
-        tool_call_id: acp::ToolCallId,
+        session_id: acp_v2::SessionId,
+        request_id: PermissionRequestId,
+        tool_call_id: acp_v2::ToolCallId,
         selected_index: usize,
         is_first: bool,
         cx: &Context<Self>,
@@ -6133,12 +10252,13 @@ impl ThreadView {
                                 &self.focus_handle(cx),
                                 cx,
                             )
-                            .map(|kb| kb.size(rems_from_px(10.))),
+                            .map(|kb| kb.size(rems_from_px(12_f32))),
                         )
                     }),
             )
             .menu(move |window, cx| {
                 let tool_call_id = tool_call_id.clone();
+                let session_id = session_id.clone();
                 let options = menu_options.clone();
 
                 Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
@@ -6146,6 +10266,7 @@ impl ThreadView {
                         let display_name = display_name.clone();
                         let index = *index;
                         let tool_call_id_for_entry = tool_call_id.clone();
+                        let session_id = session_id.clone();
                         let is_selected = index == selected_index;
                         menu = menu.toggleable_entry(
                             display_name,
@@ -6156,6 +10277,8 @@ impl ThreadView {
                                 window.dispatch_action(
                                     SelectPermissionGranularity {
                                         tool_call_id: tool_call_id_for_entry.0.to_string(),
+                                        request_id: Some(request_id),
+                                        session_id: Some(session_id.0.to_string()),
                                         index,
                                     }
                                     .boxed_clone(),
@@ -6178,7 +10301,8 @@ impl ThreadView {
         _tool_name: &str,
         current_label: SharedString,
         entry_ix: usize,
-        tool_call_id: acp::ToolCallId,
+        session_id: acp_v2::SessionId,
+        request_id: PermissionRequestId,
         is_first: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
@@ -6200,14 +10324,13 @@ impl ThreadView {
             })
             .collect();
 
-        let pattern_count = patterns.len();
         let permission_dropdown_handle = self.permission_dropdown_handle.clone();
-        let view = cx.entity().downgrade();
+        let conversation = self.conversation.downgrade();
 
         PopoverMenu::new(("permission-granularity", entry_ix))
             .with_handle(permission_dropdown_handle.clone())
-            .anchor(Corner::TopRight)
-            .attach(Corner::BottomRight)
+            .anchor(gpui::Anchor::TopRight)
+            .attach(gpui::Anchor::BottomRight)
             .trigger(
                 Button::new(("granularity-trigger", entry_ix), current_label)
                     .end_icon(
@@ -6223,15 +10346,15 @@ impl ThreadView {
                                 &self.focus_handle(cx),
                                 cx,
                             )
-                            .map(|kb| kb.size(rems_from_px(10.))),
+                            .map(|kb| kb.size(rems_from_px(12_f32))),
                         )
                     }),
             )
             .menu(move |window, cx| {
-                let tool_call_id = tool_call_id.clone();
+                let session_id = session_id.clone();
                 let options = menu_options.clone();
                 let patterns = pattern_options.clone();
-                let view = view.clone();
+                let conversation = conversation.clone();
                 let dropdown_handle = permission_dropdown_handle.clone();
 
                 Some(ContextMenu::build_persistent(
@@ -6240,10 +10363,12 @@ impl ThreadView {
                     move |menu, _window, cx| {
                         let mut menu = menu;
 
-                        // Read fresh selection state from the view on each rebuild.
-                        let selection: Option<PermissionSelection> = view.upgrade().and_then(|v| {
-                            let view = v.read(cx);
-                            view.permission_selections.get(&tool_call_id).cloned()
+                        let selection = conversation.upgrade().and_then(|conversation| {
+                            conversation
+                                .read(cx)
+                                .permission_selections
+                                .get(&request_id)
+                                .cloned()
                         });
 
                         let is_pattern_mode =
@@ -6253,28 +10378,30 @@ impl ThreadView {
                         for (index, display_name) in options.iter() {
                             let display_name = display_name.clone();
                             let index = *index;
-                            let tool_call_id_for_entry = tool_call_id.clone();
+                            let session_id = session_id.clone();
                             let is_selected = !is_pattern_mode
                                 && selection
                                     .as_ref()
                                     .and_then(|s| s.choice_index())
                                     .map_or(index == default_choice_index, |ci| ci == index);
 
-                            let view = view.clone();
+                            let conversation = conversation.clone();
                             menu = menu.toggleable_entry(
                                 display_name,
                                 is_selected,
                                 IconPosition::End,
                                 None,
                                 move |_window, cx| {
-                                    view.update(cx, |this, cx| {
-                                        this.permission_selections.insert(
-                                            tool_call_id_for_entry.clone(),
-                                            PermissionSelection::Choice(index),
-                                        );
-                                        cx.notify();
-                                    })
-                                    .log_err();
+                                    conversation
+                                        .update(cx, |conversation, cx| {
+                                            conversation.set_permission_choice(
+                                                &session_id,
+                                                request_id,
+                                                index,
+                                                cx,
+                                            );
+                                        })
+                                        .log_err();
                                 },
                             );
                         }
@@ -6284,45 +10411,28 @@ impl ThreadView {
                         for (pattern_index, label) in patterns.iter() {
                             let label = label.clone();
                             let pattern_index = *pattern_index;
-                            let tool_call_id_for_pattern = tool_call_id.clone();
+                            let session_id = session_id.clone();
                             let is_checked = selection
                                 .as_ref()
                                 .is_some_and(|s| s.is_pattern_checked(pattern_index));
 
-                            let view = view.clone();
+                            let conversation = conversation.clone();
                             menu = menu.toggleable_entry(
                                 label,
                                 is_checked,
                                 IconPosition::End,
                                 None,
                                 move |_window, cx| {
-                                    view.update(cx, |this, cx| {
-                                        let selection = this
-                                            .permission_selections
-                                            .get_mut(&tool_call_id_for_pattern);
-
-                                        match selection {
-                                            Some(PermissionSelection::SelectedPatterns(_)) => {
-                                                // Already in pattern mode — toggle.
-                                                this.permission_selections
-                                                    .get_mut(&tool_call_id_for_pattern)
-                                                    .expect("just matched above")
-                                                    .toggle_pattern(pattern_index);
-                                            }
-                                            _ => {
-                                                // First click: activate pattern mode
-                                                // with all patterns checked.
-                                                this.permission_selections.insert(
-                                                    tool_call_id_for_pattern.clone(),
-                                                    PermissionSelection::SelectedPatterns(
-                                                        (0..pattern_count).collect(),
-                                                    ),
-                                                );
-                                            }
-                                        }
-                                        cx.notify();
-                                    })
-                                    .log_err();
+                                    conversation
+                                        .update(cx, |conversation, cx| {
+                                            conversation.toggle_permission_pattern(
+                                                &session_id,
+                                                request_id,
+                                                pattern_index,
+                                                cx,
+                                            );
+                                        })
+                                        .log_err();
                                 },
                             );
                         }
@@ -6360,15 +10470,16 @@ impl ThreadView {
 
     fn render_permission_buttons_flat(
         &self,
-        session_id: acp::SessionId,
+        session_id: acp_v2::SessionId,
         is_first: bool,
-        options: &[acp::PermissionOption],
+        options: &[acp_v2::PermissionOption],
         entry_ix: usize,
-        tool_call_id: acp::ToolCallId,
+        request_id: PermissionRequestId,
         focus_handle: &FocusHandle,
+        allow_disabled: bool,
         cx: &Context<Self>,
     ) -> Div {
-        let mut seen_kinds: ArrayVec<acp::PermissionOptionKind, 3, u8> = ArrayVec::new();
+        let mut seen_kinds: ArrayVec<acp_v2::PermissionOptionKind, 3, u8> = ArrayVec::new();
 
         div()
             .p_1()
@@ -6381,62 +10492,93 @@ impl ThreadView {
                 let option_id = SharedString::from(option.option_id.0.clone());
                 Button::new((option_id, entry_ix), option.name.clone())
                     .map(|this| {
-                        let (icon, action) = match option.kind {
-                            acp::PermissionOptionKind::AllowOnce => (
-                                Icon::new(IconName::Check)
+                        // The sandbox-fallback prompt offers a "Retry" option
+                        // that re-attempts creating the sandbox; it isn't an
+                        // allow/deny choice, so give it its own icon and no
+                        // keybinding.
+                        let is_retry = option.option_id.0.as_ref()
+                            == acp_thread::SANDBOX_FALLBACK_RETRY_OPTION_ID;
+                        let (icon, action) = if is_retry {
+                            (
+                                Icon::new(IconName::RotateCcw)
                                     .size(IconSize::XSmall)
-                                    .color(Color::Success),
-                                Some(&AllowOnce as &dyn Action),
-                            ),
-                            acp::PermissionOptionKind::AllowAlways => (
-                                Icon::new(IconName::CheckDouble)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Success),
-                                Some(&AllowAlways as &dyn Action),
-                            ),
-                            acp::PermissionOptionKind::RejectOnce => (
-                                Icon::new(IconName::Close)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Error),
-                                Some(&RejectOnce as &dyn Action),
-                            ),
-                            acp::PermissionOptionKind::RejectAlways | _ => (
-                                Icon::new(IconName::Close)
-                                    .size(IconSize::XSmall)
-                                    .color(Color::Error),
+                                    .color(Color::Muted),
                                 None,
-                            ),
+                            )
+                        } else {
+                            match &option.kind {
+                                acp_v2::PermissionOptionKind::AllowOnce => (
+                                    Icon::new(IconName::Check)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Success),
+                                    Some(&AllowOnce as &dyn Action),
+                                ),
+                                acp_v2::PermissionOptionKind::AllowAlways => (
+                                    Icon::new(IconName::CheckDouble)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Success),
+                                    if option.option_id.0.as_ref()
+                                        == acp_thread::SandboxPermission::AllowThread.as_id()
+                                    {
+                                        None
+                                    } else {
+                                        Some(&AllowAlways as &dyn Action)
+                                    },
+                                ),
+                                acp_v2::PermissionOptionKind::RejectOnce => (
+                                    Icon::new(IconName::Close)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Error),
+                                    Some(&RejectOnce as &dyn Action),
+                                ),
+                                acp_v2::PermissionOptionKind::RejectAlways | _ => (
+                                    Icon::new(IconName::Close)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Error),
+                                    None,
+                                ),
+                            }
                         };
 
-                        let this = this.start_icon(icon);
+                        // An "allow" choice is disabled while a surprising-Unicode
+                        // warning is unacknowledged; "deny"/"retry" stay enabled.
+                        let is_allow = matches!(
+                            option.kind,
+                            acp_v2::PermissionOptionKind::AllowOnce
+                                | acp_v2::PermissionOptionKind::AllowAlways
+                        ) && !is_retry;
+                        let disabled = allow_disabled && is_allow;
+
+                        let this = this.start_icon(icon).disabled(disabled);
 
                         let Some(action) = action else {
                             return this;
                         };
 
-                        if !is_first || seen_kinds.contains(&option.kind) {
+                        if !is_first || disabled || seen_kinds.contains(&option.kind) {
                             return this;
                         }
 
-                        seen_kinds.push(option.kind).unwrap();
+                        seen_kinds.push(option.kind.clone()).unwrap();
 
                         this.key_binding(
                             KeyBinding::for_action_in(action, focus_handle, cx)
-                                .map(|kb| kb.size(rems_from_px(10.))),
+                                .map(|kb| kb.size(rems_from_px(12_f32))),
                         )
                     })
                     .label_size(LabelSize::Small)
                     .on_click(cx.listener({
-                        let session_id = session_id.clone();
-                        let tool_call_id = tool_call_id.clone();
                         let option_id = option.option_id.clone();
-                        let option_kind = option.kind;
+                        let option_kind = option.kind.clone();
+                        let session_id = session_id.clone();
                         move |this, _, window, cx| {
-                            this.authorize_tool_call(
+                            this.authorize_permission_request(
                                 session_id.clone(),
-                                tool_call_id.clone(),
-                                option_id.clone().into(),
-                                option_kind,
+                                request_id,
+                                SelectedPermissionOutcome::new(
+                                    option_id.clone(),
+                                    option_kind.clone(),
+                                ),
                                 window,
                                 cx,
                             );
@@ -6486,6 +10628,19 @@ impl ThreadView {
             .into_any_element()
     }
 
+    fn tool_call_icon_tooltip(
+        tool_name: Option<&SharedString>,
+        interrupted_edit: bool,
+    ) -> Option<SharedString> {
+        let tool_name = tool_name.filter(|name| !name.trim().is_empty());
+        match (tool_name, interrupted_edit) {
+            (Some(name), true) => Some(format!("Interrupted Edit\nTool: {name}").into()),
+            (Some(name), false) => Some(format!("Tool: {name}").into()),
+            (None, true) => Some("Interrupted Edit".into()),
+            (None, false) => None,
+        }
+    }
+
     fn render_tool_call_label(
         &self,
         entry_ix: usize,
@@ -6498,21 +10653,20 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> Div {
         let has_location = tool_call.locations.len() == 1;
-        let is_file = tool_call.kind == acp::ToolKind::Edit && has_location;
+        let is_file = matches!(tool_call.kind(), acp_v2::ToolKind::Edit) && has_location;
         let is_subagent_tool_call = tool_call.is_subagent();
 
         let file_icon = if has_location {
             FileIcons::get_icon(&tool_call.locations[0].path, cx)
-                .map(Icon::from_path)
-                .unwrap_or(Icon::new(IconName::ToolPencil))
+                .map(|from_path| Icon::from_path(from_path).color(Color::Muted))
+                .unwrap_or(Icon::new(IconName::ToolPencil).color(Color::Muted))
         } else {
-            Icon::new(IconName::ToolPencil)
+            Icon::new(IconName::ToolPencil).color(Color::Muted)
         };
 
-        let tool_icon = if is_file && has_failed && has_revealed_diff {
+        let interrupted_edit = is_file && has_failed && has_revealed_diff;
+        let tool_icon = if interrupted_edit {
             div()
-                .id(entry_ix)
-                .tooltip(Tooltip::text("Interrupted Edit"))
                 .child(DecoratedIcon::new(
                     file_icon,
                     Some(
@@ -6537,17 +10691,17 @@ impl ThreadView {
                 .color(Color::Muted)
                 .into_any_element()
         } else {
-            Icon::new(match tool_call.kind {
-                acp::ToolKind::Read => IconName::ToolSearch,
-                acp::ToolKind::Edit => IconName::ToolPencil,
-                acp::ToolKind::Delete => IconName::ToolDeleteFile,
-                acp::ToolKind::Move => IconName::ArrowRightLeft,
-                acp::ToolKind::Search => IconName::ToolSearch,
-                acp::ToolKind::Execute => IconName::ToolTerminal,
-                acp::ToolKind::Think => IconName::ToolThink,
-                acp::ToolKind::Fetch => IconName::ToolWeb,
-                acp::ToolKind::SwitchMode => IconName::ArrowRightLeft,
-                acp::ToolKind::Other | _ => IconName::ToolHammer,
+            Icon::new(match tool_call.kind() {
+                acp_v2::ToolKind::Read => IconName::ToolSearch,
+                acp_v2::ToolKind::Edit => IconName::ToolPencil,
+                acp_v2::ToolKind::Delete => IconName::ToolDeleteFile,
+                acp_v2::ToolKind::Move => IconName::ArrowRightLeft,
+                acp_v2::ToolKind::Search => IconName::ToolSearch,
+                acp_v2::ToolKind::Execute => IconName::ToolTerminal,
+                acp_v2::ToolKind::Think => IconName::ToolThink,
+                acp_v2::ToolKind::Fetch => IconName::ToolWeb,
+                acp_v2::ToolKind::SwitchMode => IconName::ArrowRightLeft,
+                _ => IconName::ToolHammer,
             })
             .size(IconSize::Small)
             .color(Color::Muted)
@@ -6590,11 +10744,23 @@ impl ThreadView {
             .when(has_location || use_card_layout, |this| this.px_1())
             .when(has_location, |this| {
                 this.cursor(CursorStyle::PointingHand)
-                    .rounded(rems_from_px(3.)) // Concentric border radius
+                    .rounded(rems_from_px(3_f32)) // Concentric border radius
                     .hover(|s| s.bg(cx.theme().colors().element_hover.opacity(0.5)))
             })
             .overflow_hidden()
-            .child(tool_icon)
+            .child(
+                div()
+                    .id(("tool-call-icon", entry_ix))
+                    .flex_none()
+                    .when_some(
+                        Self::tool_call_icon_tooltip(
+                            tool_call.tool_name.as_ref(),
+                            interrupted_edit,
+                        ),
+                        |this, tooltip| this.tooltip(Tooltip::text(tooltip)),
+                    )
+                    .child(tool_icon),
+            )
             .child(if has_location {
                 h_flex()
                     .id(("open-tool-call-location", entry_ix))
@@ -6614,6 +10780,7 @@ impl ThreadView {
                                 ..MarkdownStyle::themed(MarkdownFont::Agent, window, cx)
                                     .with_muted_text(cx)
                             },
+                            cx,
                         ),
                     )
                     .tooltip(Tooltip::text("Go to File"))
@@ -6627,6 +10794,7 @@ impl ThreadView {
                     .child(self.render_markdown(
                         tool_call.label.clone(),
                         MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx),
+                        cx,
                     ))
                     .into_any()
             })
@@ -6651,12 +10819,24 @@ impl ThreadView {
             .project
             .upgrade()?
             .read(cx)
-            .find_project_path(&tool_call_location.path, cx)?;
+            .find_project_path(&tool_call_location.path, cx);
 
         let open_task = self
             .workspace
             .update(cx, |workspace, cx| {
-                workspace.open_path(project_path, None, true, window, cx)
+                if let Some(project_path) = project_path {
+                    workspace.open_path(project_path, None, true, window, cx)
+                } else {
+                    workspace.open_abs_path(
+                        tool_call_location.path.clone(),
+                        OpenOptions {
+                            focus: Some(true),
+                            ..Default::default()
+                        },
+                        window,
+                        cx,
+                    )
+                }
             })
             .log_err()?;
         window
@@ -6668,17 +10848,10 @@ impl ThreadView {
                 };
 
                 active_editor.update_in(cx, |editor, window, cx| {
-                    let singleton = editor
-                        .buffer()
-                        .read(cx)
-                        .read(cx)
-                        .as_singleton()
-                        .map(|(a, b, _)| (a, b));
-                    if let Some((excerpt_id, buffer_id)) = singleton
-                        && let Some(agent_buffer) = agent_location.buffer.upgrade()
-                        && agent_buffer.read(cx).remote_id() == buffer_id
+                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                    if snapshot.as_singleton().is_some()
+                        && let Some(anchor) = snapshot.anchor_in_excerpt(agent_location.position)
                     {
-                        let anchor = editor::Anchor::in_buffer(excerpt_id, agent_location.position);
                         editor.change_selections(Default::default(), window, cx, |selections| {
                             selections.select_anchor_ranges([anchor..anchor]);
                         })
@@ -6699,64 +10872,206 @@ impl ThreadView {
 
     fn render_tool_call_content(
         &self,
-        session_id: &acp::SessionId,
+        session_id: &acp_v2::SessionId,
         entry_ix: usize,
         content: &ToolCallContent,
         context_ix: usize,
         tool_call: &ToolCall,
         card_layout: bool,
-        is_image_tool_call: bool,
         has_failed: bool,
         focus_handle: &FocusHandle,
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
         match content {
-            ToolCallContent::ContentBlock(content) => {
-                if let Some(resource_link) = content.resource_link() {
-                    self.render_resource_link(resource_link, cx)
-                } else if let Some(markdown) = content.markdown() {
-                    self.render_markdown_output(
-                        markdown.clone(),
-                        tool_call.id.clone(),
-                        context_ix,
-                        card_layout,
-                        window,
-                        cx,
-                    )
-                } else if let Some(image) = content.image() {
-                    let location = tool_call.locations.first().cloned();
-                    self.render_image_output(
-                        entry_ix,
-                        image.clone(),
-                        location,
-                        card_layout,
-                        is_image_tool_call,
-                        cx,
-                    )
-                } else {
-                    Empty.into_any_element()
-                }
-            }
-            ToolCallContent::Diff(diff) => {
+            ToolCallContent::ContentBlock { block, .. } => self.render_output_content_block(
+                entry_ix,
+                context_ix,
+                block.as_view(),
+                Some(tool_call),
+                card_layout,
+                window,
+                cx,
+            ),
+            ToolCallContent::Diff(diff) | ToolCallContent::LegacyDiff { diff, .. } => {
                 self.render_diff_editor(entry_ix, diff, tool_call, has_failed, cx)
             }
-            ToolCallContent::Terminal(terminal) => self.render_terminal_tool_call(
+            ToolCallContent::Terminal { terminal, .. } => self.render_terminal_tool_call(
                 session_id,
                 entry_ix,
                 terminal,
                 tool_call,
                 focus_handle,
-                false,
+                ToolCallLayout::Standalone,
+                window,
+                cx,
+            ),
+            ToolCallContent::DiffPatch { source, render } => {
+                let files = render.files.iter().filter_map(|file| {
+                    let change = source.changes.get(file.change_index)?;
+                    Some(
+                        v_flex()
+                            .gap_1()
+                            .p_2()
+                            .when(context_ix > 0, |this| {
+                                this.border_t_1()
+                                    .border_color(self.tool_card_border_color(cx))
+                            })
+                            .child(
+                                Label::new(acp_thread::diff_change_label(change))
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .when(file.hunks.is_empty(), |this| {
+                                this.child(
+                                    Label::new("No text preview available")
+                                        .size(LabelSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                            })
+                            .children(file.hunks.iter().map(|hunk| {
+                                v_flex()
+                                    .child(
+                                        Label::new(hunk.header.clone())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Muted),
+                                    )
+                                    .when_some(
+                                        self.entry_view_state.read(cx).entry(entry_ix).and_then(
+                                            |entry| entry.editor_for_patch_hunk(&hunk.buffer),
+                                        ),
+                                        |this, editor| this.child(editor),
+                                    )
+                            })),
+                    )
+                });
+                v_flex()
+                    .children(files)
+                    .when(
+                        render.files.is_empty() && render.fallback.is_none(),
+                        |this| {
+                            this.p_2().child(
+                                Label::new("No text preview available")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                        },
+                    )
+                    .when_some(render.fallback.as_ref(), |this, markdown| {
+                        this.child(self.render_markdown_output(
+                            markdown.clone(),
+                            entry_ix,
+                            context_ix,
+                            tool_call,
+                            card_layout,
+                            window,
+                            cx,
+                        ))
+                    })
+                    .into_any_element()
+            }
+            ToolCallContent::Other { markdown, .. } => self.render_markdown_output(
+                markdown.clone(),
+                entry_ix,
+                context_ix,
+                tool_call,
+                card_layout,
                 window,
                 cx,
             ),
         }
     }
 
+    fn render_output_content_block(
+        &self,
+        entry_ix: usize,
+        context_ix: usize,
+        content: acp_thread::ContentBlockView<'_>,
+        tool_call: Option<&ToolCall>,
+        card_layout: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        if let Some(markdown) = content.markdown() {
+            if let Some(tool_call) = tool_call {
+                self.render_markdown_output(
+                    markdown.clone(),
+                    entry_ix,
+                    context_ix,
+                    tool_call,
+                    card_layout,
+                    window,
+                    cx,
+                )
+            } else {
+                self.render_markdown(
+                    markdown.clone(),
+                    MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                    cx,
+                )
+                .into_any()
+            }
+        } else if let Some((resource, _)) = content.embedded_resource() {
+            if tool_call.is_some() {
+                self.render_embedded_resource_output(resource, context_ix, card_layout, cx)
+            } else {
+                self.render_embedded_resource_label(resource)
+            }
+        } else if let Some(resource_link) = content.resource_link() {
+            self.render_resource_link(resource_link, cx)
+        } else if let Some((image, _)) = content.image() {
+            let location = tool_call.and_then(|tool_call| tool_call.locations.first().cloned());
+            self.render_image_output(entry_ix, image.clone(), location, card_layout, cx)
+        } else {
+            Empty.into_any_element()
+        }
+    }
+
+    fn render_embedded_resource_output(
+        &self,
+        resource: &acp_v2::EmbeddedResource,
+        context_ix: usize,
+        card_layout: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        v_flex()
+            .gap_1()
+            .map(|this| {
+                if card_layout {
+                    this.p_2().when(context_ix > 0, |this| {
+                        this.border_t_1()
+                            .border_color(self.tool_card_border_color(cx))
+                    })
+                } else {
+                    this.ml(rems(0.4))
+                        .px_3p5()
+                        .border_l_1()
+                        .border_color(self.tool_card_border_color(cx))
+                }
+            })
+            .child(self.render_embedded_resource_label(resource))
+            .into_any_element()
+    }
+
+    fn render_embedded_resource_label(&self, resource: &acp_v2::EmbeddedResource) -> AnyElement {
+        let uri = match &resource.resource {
+            acp_v2::EmbeddedResourceResource::BlobResourceContents(blob) => blob.uri.as_str(),
+            acp_v2::EmbeddedResourceResource::TextResourceContents(text) => text.uri.as_str(),
+            _ => "",
+        };
+        if uri.is_empty() {
+            Empty.into_any_element()
+        } else {
+            Label::new(uri.to_string())
+                .size(LabelSize::XSmall)
+                .color(Color::Muted)
+                .into_any_element()
+        }
+    }
+
     fn render_resource_link(
         &self,
-        resource_link: &acp::ResourceLink,
+        resource_link: &acp_v2::ResourceLink,
         cx: &Context<Self>,
     ) -> AnyElement {
         let uri: SharedString = resource_link.uri.clone().into();
@@ -6767,7 +11082,12 @@ impl ThreadView {
         };
 
         let label: SharedString = if let Some(abs_path) = is_file {
-            if let Some(project_path) = project
+            // Split off an optional `#L<line>` fragment so the path still resolves.
+            let (abs_path, fragment) = abs_path
+                .split_once('#')
+                .map_or((abs_path, None), |(path, fragment)| (path, Some(fragment)));
+
+            let path_label = if let Some(project_path) = project
                 .read(cx)
                 .project_path_for_absolute_path(&Path::new(abs_path), cx)
                 && let Some(worktree) = project
@@ -6779,9 +11099,13 @@ impl ThreadView {
                     .full_path(&project_path.path)
                     .to_string_lossy()
                     .to_string()
-                    .into()
             } else {
-                abs_path.to_string().into()
+                abs_path.to_string()
+            };
+
+            match fragment {
+                Some(fragment) => format!("{path_label}#{fragment}").into(),
+                None => path_label.into(),
             }
         } else {
             uri.clone()
@@ -6826,7 +11150,7 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         let tool_progress = matches!(
-            &tool_call.status,
+            tool_call.status(),
             ToolCallStatus::InProgress | ToolCallStatus::Pending
         );
 
@@ -6862,21 +11186,34 @@ impl ThreadView {
     fn render_markdown_output(
         &self,
         markdown: Entity<Markdown>,
-        tool_call_id: acp::ToolCallId,
+        entry_ix: usize,
         context_ix: usize,
+        tool_call: &ToolCall,
         card_layout: bool,
         window: &Window,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let button_id = SharedString::from(format!("tool_output-{:?}", tool_call_id));
+        let markdown_style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+        let output = self
+            .render_numbered_read_file_output(
+                markdown.clone(),
+                entry_ix,
+                context_ix,
+                tool_call,
+                markdown_style.clone(),
+                cx,
+            )
+            .unwrap_or_else(|| {
+                self.render_markdown(markdown, markdown_style, cx)
+                    .into_any()
+            });
 
         v_flex()
             .gap_2()
             .map(|this| {
                 if card_layout {
-                    this.when(context_ix > 0, |this| {
-                        this.pt_2()
-                            .border_t_1()
+                    this.p_2().when(context_ix > 0, |this| {
+                        this.border_t_1()
                             .border_color(self.tool_card_border_color(cx))
                     })
                 } else {
@@ -6888,57 +11225,49 @@ impl ThreadView {
             })
             .text_xs()
             .text_color(cx.theme().colors().text_muted)
-            .child(self.render_markdown(
-                markdown,
-                MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-            ))
-            .when(!card_layout, |this| {
-                this.child(
-                    IconButton::new(button_id, IconName::ChevronUp)
-                        .full_width()
-                        .style(ButtonStyle::Outlined)
-                        .icon_color(Color::Muted)
-                        .on_click(cx.listener({
-                            move |this: &mut Self, _, _, cx: &mut Context<Self>| {
-                                this.expanded_tool_calls.remove(&tool_call_id);
-                                cx.notify();
-                            }
-                        })),
-                )
-            })
+            .child(output)
             .into_any_element()
+    }
+
+    fn render_numbered_read_file_output(
+        &self,
+        markdown: Entity<Markdown>,
+        entry_ix: usize,
+        context_ix: usize,
+        tool_call: &ToolCall,
+        markdown_style: MarkdownStyle,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        let is_read_file = tool_call
+            .tool_name
+            .as_ref()
+            .is_some_and(|tool_name| tool_name.as_ref() == "read_file");
+        if !is_read_file {
+            return None;
+        }
+
+        let markdown = markdown.read(cx);
+        let parsed = parse_cat_numbered_markdown_code_block(markdown.source())?;
+        let language = markdown.first_code_block_language();
+        Some(render_cat_numbered_code_block(
+            parsed,
+            language,
+            markdown_style,
+            format!("copy-read-file-output-{entry_ix}-{context_ix}"),
+            cx,
+        ))
     }
 
     fn render_image_output(
         &self,
         entry_ix: usize,
         image: Arc<gpui::Image>,
-        location: Option<acp::ToolCallLocation>,
+        location: Option<ToolCallLocation>,
         card_layout: bool,
-        show_dimensions: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let dimensions_label = if show_dimensions {
-            let format_name = match image.format() {
-                gpui::ImageFormat::Png => "PNG",
-                gpui::ImageFormat::Jpeg => "JPEG",
-                gpui::ImageFormat::Webp => "WebP",
-                gpui::ImageFormat::Gif => "GIF",
-                gpui::ImageFormat::Svg => "SVG",
-                gpui::ImageFormat::Bmp => "BMP",
-                gpui::ImageFormat::Tiff => "TIFF",
-                gpui::ImageFormat::Ico => "ICO",
-            };
-            let dimensions = image::ImageReader::new(std::io::Cursor::new(image.bytes()))
-                .with_guessed_format()
-                .ok()
-                .and_then(|reader| reader.into_dimensions().ok());
-            dimensions.map(|(w, h)| format!("{}×{} {}", w, h, format_name))
-        } else {
-            None
-        };
-
         v_flex()
+            .debug_selector(|| "agent-output-image".into())
             .gap_2()
             .map(|this| {
                 if card_layout {
@@ -6950,27 +11279,15 @@ impl ThreadView {
                         .border_color(self.tool_card_border_color(cx))
                 }
             })
-            .when(dimensions_label.is_some() || location.is_some(), |this| {
+            .when_some(location, |this, _loc| {
                 this.child(
-                    h_flex()
-                        .w_full()
-                        .justify_between()
-                        .items_center()
-                        .children(dimensions_label.map(|label| {
-                            Label::new(label)
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .buffer_font(cx)
-                        }))
-                        .when_some(location, |this, _loc| {
-                            this.child(
-                                Button::new(("go-to-file", entry_ix), "Go to File")
-                                    .label_size(LabelSize::Small)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_tool_call_location(entry_ix, 0, window, cx);
-                                    })),
-                            )
-                        }),
+                    h_flex().w_full().justify_end().child(
+                        Button::new(("go-to-file", entry_ix), "Go to File")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_tool_call_location(entry_ix, 0, window, cx);
+                            })),
+                    ),
                 )
             })
             .child(
@@ -6984,19 +11301,19 @@ impl ThreadView {
 
     fn render_subagent_tool_call(
         &self,
-        active_session_id: &acp::SessionId,
+        active_session_id: &acp_v2::SessionId,
         entry_ix: usize,
         tool_call: &ToolCall,
-        subagent_session_id: Option<acp::SessionId>,
+        subagent_session_id: Option<acp_v2::SessionId>,
         focus_handle: &FocusHandle,
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        let subagent_thread_view = subagent_session_id.and_then(|id| {
+        let subagent_thread_view = subagent_session_id.and_then(|session_id| {
             self.server_view
                 .upgrade()
                 .and_then(|server_view| server_view.read(cx).as_connected())
-                .and_then(|connected| connected.threads.get(&id))
+                .and_then(|connected| connected.threads.get(&session_id))
         });
 
         let content = self.render_subagent_card(
@@ -7014,7 +11331,7 @@ impl ThreadView {
 
     fn render_subagent_card(
         &self,
-        active_session_id: &acp::SessionId,
+        active_session_id: &acp_v2::SessionId,
         entry_ix: usize,
         thread_view: Option<&Entity<ThreadView>>,
         tool_call: &ToolCall,
@@ -7030,45 +11347,54 @@ impl ThreadView {
             .map(|thread| thread.read(cx).session_id().clone());
         let action_log = thread.as_ref().map(|thread| thread.read(cx).action_log());
         let changed_buffers = action_log
-            .map(|log| log.read(cx).changed_buffers(cx))
+            .map(|log| log.read(cx).changed_buffers(cx).collect::<Vec<_>>())
             .unwrap_or_default();
 
-        let is_pending_tool_call = thread
+        let is_pending_tool_call = thread_view
             .as_ref()
-            .and_then(|thread| {
-                self.conversation
-                    .read(cx)
-                    .pending_tool_call(thread.read(cx).session_id(), cx)
+            .and_then(|tv| {
+                let sid = tv.read(cx).thread.read(cx).session_id();
+                self.conversation.read(cx).pending_tool_call(sid, cx)
             })
             .is_some();
 
-        let is_expanded = self.expanded_tool_calls.contains(&tool_call.id);
+        let is_expanded = self
+            .entry_view_state
+            .read(cx)
+            .is_tool_call_expanded(&tool_call.id);
         let files_changed = changed_buffers.len();
-        let diff_stats = DiffStats::all_files(&changed_buffers, cx);
+        let diff_stats = DiffStats::all_files(changed_buffers, cx);
 
         let is_running = matches!(
-            tool_call.status,
+            tool_call.status(),
             ToolCallStatus::Pending
                 | ToolCallStatus::InProgress
-                | ToolCallStatus::WaitingForConfirmation { .. }
+                | ToolCallStatus::WaitingForConfirmation
         );
 
         let is_failed = matches!(
-            tool_call.status,
+            tool_call.status(),
             ToolCallStatus::Failed | ToolCallStatus::Rejected
         );
 
-        let is_cancelled = matches!(tool_call.status, ToolCallStatus::Canceled)
-            || tool_call.content.iter().any(|c| match c {
-                ToolCallContent::ContentBlock(ContentBlock::Markdown { markdown }) => {
-                    markdown.read(cx).source() == "User canceled"
+        let is_cancelled = matches!(tool_call.status(), ToolCallStatus::Canceled)
+            || tool_call.content().iter().any(|c| match c {
+                ToolCallContent::ContentBlock { block, .. } => {
+                    block.text_content(cx) == Some("User canceled")
                 }
                 _ => false,
             });
 
+        let model_name = thread_view
+            .and_then(|view| view.read(cx).as_native_thread(cx))
+            .and_then(|thread| {
+                let thread = thread.read(cx);
+                let model = thread.model()?;
+                Some(model.name().0)
+            });
         let thread_title = thread
             .as_ref()
-            .map(|t| t.read(cx).title())
+            .and_then(|t| t.read(cx).title())
             .filter(|t| !t.is_empty());
         let tool_call_label = tool_call.label.read(cx).source().to_string();
         let has_tool_call_label = !tool_call_label.is_empty();
@@ -7135,7 +11461,7 @@ impl ThreadView {
             "Click to Preview"
         };
 
-        let error_message = self.subagent_error_message(&tool_call.status, tool_call, cx);
+        let error_message = self.subagent_error_message(&tool_call.status(), tool_call, cx);
 
         v_flex()
             .w_full()
@@ -7167,33 +11493,64 @@ impl ThreadView {
                             .child(
                                 h_flex()
                                     .min_w_0()
-                                    .w_full()
+                                    .flex_1()
                                     .gap_1p5()
-                                    .child(icon)
+                                    .justify_between()
                                     .child(
-                                        Label::new(title.to_string())
-                                            .size(LabelSize::Custom(self.tool_name_font_size()))
-                                            .truncate(),
+                                        h_flex()
+                                            .min_w_0()
+                                            .flex_initial()
+                                            .gap_1p5()
+                                            .child(icon)
+                                            .child(
+                                                Label::new(title.to_string())
+                                                    .size(LabelSize::Custom(
+                                                        self.tool_name_font_size(),
+                                                    ))
+                                                    .flex_1()
+                                                    .truncate(),
+                                            )
+                                            .when_some(model_name, |this, model_name| {
+                                                this.child(
+                                                    Label::new(format!("· {model_name}"))
+                                                        .size(LabelSize::Custom(
+                                                            self.tool_name_font_size(),
+                                                        ))
+                                                        .color(Color::Muted)
+                                                        .truncate(),
+                                                )
+                                            }),
                                     )
                                     .when(files_changed > 0, |this| {
                                         this.child(
-                                            Label::new(format!(
-                                                "— {} {} changed",
-                                                files_changed,
-                                                if files_changed == 1 { "file" } else { "files" }
-                                            ))
-                                            .size(LabelSize::Custom(self.tool_name_font_size()))
-                                            .color(Color::Muted),
-                                        )
-                                        .child(
-                                            DiffStat::new(
-                                                diff_stat_id.clone(),
-                                                diff_stats.lines_added as usize,
-                                                diff_stats.lines_removed as usize,
-                                            )
-                                            .label_size(LabelSize::Custom(
-                                                self.tool_name_font_size(),
-                                            )),
+                                            h_flex()
+                                                .flex_none()
+                                                .gap_1p5()
+                                                .child(
+                                                    Label::new(format!(
+                                                        "— {} {} changed",
+                                                        files_changed,
+                                                        if files_changed == 1 {
+                                                            "file"
+                                                        } else {
+                                                            "files"
+                                                        }
+                                                    ))
+                                                    .size(LabelSize::Custom(
+                                                        self.tool_name_font_size(),
+                                                    ))
+                                                    .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    DiffStat::new(
+                                                        diff_stat_id.clone(),
+                                                        diff_stats.lines_added as usize,
+                                                        diff_stats.lines_removed as usize,
+                                                    )
+                                                    .label_size(LabelSize::Custom(
+                                                        self.tool_name_font_size(),
+                                                    )),
+                                                ),
                                         )
                                     }),
                             )
@@ -7223,15 +11580,13 @@ impl ThreadView {
                                     )
                                     .on_click(cx.listener({
                                         let tool_call_id = tool_call.id.clone();
-                                        move |this, _, _, cx| {
-                                            if this.expanded_tool_calls.contains(&tool_call_id) {
-                                                this.expanded_tool_calls.remove(&tool_call_id);
-                                            } else {
-                                                this.expanded_tool_calls
-                                                    .insert(tool_call_id.clone());
-                                            }
+                                        move |this, _, window, cx| {
                                             let expanded =
-                                                this.expanded_tool_calls.contains(&tool_call_id);
+                                                this.entry_view_state.update(cx, |state, _cx| {
+                                                    state.toggle_tool_call_expansion(&tool_call_id);
+                                                    state.is_tool_call_expanded(&tool_call_id)
+                                                });
+                                            this.refresh_thread_search(window, cx);
                                             telemetry::event!("Subagent Toggled", expanded);
                                             cx.notify();
                                         }
@@ -7264,12 +11619,13 @@ impl ThreadView {
             )
             .when_some(thread_view, |this, thread_view| {
                 let thread = &thread_view.read(cx).thread;
+                let tv_session_id = thread.read(cx).session_id();
                 let pending_tool_call = self
                     .conversation
                     .read(cx)
-                    .pending_tool_call(thread.read(cx).session_id(), cx);
+                    .pending_tool_call(tv_session_id, cx);
 
-                let session_id = thread.read(cx).session_id().clone();
+                let nav_session_id = tv_session_id.clone();
 
                 let fullscreen_toggle = h_flex()
                     .id(entry_ix)
@@ -7291,7 +11647,7 @@ impl ThreadView {
                         telemetry::event!("Subagent Maximized");
                         this.server_view
                             .update(cx, |this, cx| {
-                                this.navigate_to_session(session_id.clone(), window, cx);
+                                this.navigate_to_thread(nav_session_id.clone(), window, cx);
                             })
                             .ok();
                     }));
@@ -7306,7 +11662,7 @@ impl ThreadView {
                                 entry_ix,
                                 tool_call,
                                 focus_handle,
-                                true,
+                                ToolCallLayout::Embedded,
                                 window,
                                 cx,
                             ))
@@ -7318,7 +11674,6 @@ impl ThreadView {
                     this.when(is_expanded, |this| {
                         this.child(self.render_subagent_expanded_content(
                             thread_view,
-                            is_running,
                             tool_call,
                             window,
                             cx,
@@ -7341,7 +11696,6 @@ impl ThreadView {
     fn render_subagent_expanded_content(
         &self,
         thread_view: &Entity<ThreadView>,
-        is_running: bool,
         tool_call: &ToolCall,
         window: &Window,
         cx: &Context<Self>,
@@ -7352,7 +11706,7 @@ impl ThreadView {
         let session_id = subagent_view.thread.read(cx).session_id().clone();
 
         let is_canceled_or_failed = matches!(
-            tool_call.status,
+            tool_call.status(),
             ToolCallStatus::Canceled | ToolCallStatus::Failed | ToolCallStatus::Rejected
         );
 
@@ -7390,12 +11744,11 @@ impl ThreadView {
         let scroll_handle = self
             .subagent_scroll_handles
             .borrow_mut()
-            .entry(session_id.clone())
+            .entry(subagent_view.session_id.clone())
             .or_default()
             .clone();
-        if is_running {
-            scroll_handle.scroll_to_bottom();
-        }
+
+        scroll_handle.scroll_to_bottom();
 
         let rendered_entries: Vec<AnyElement> = entries
             .get(entry_range)
@@ -7418,7 +11771,13 @@ impl ThreadView {
                 div()
                     .pb_1()
                     .min_h_0()
-                    .id(format!("subagent-entries-{}", session_id))
+                    // Include the tool call id so the same subagent session
+                    // rendered in multiple parent cards gets distinct element
+                    // ids for its inlined entries (avoids duplicate a11y ids).
+                    .id(format!(
+                        "subagent-entries-{}-{}",
+                        session_id, tool_call.id.0
+                    ))
                     .track_scroll(&scroll_handle)
                     .children(rendered_entries),
             )
@@ -7434,16 +11793,14 @@ impl ThreadView {
         cx: &App,
     ) -> Option<SharedString> {
         if matches!(status, ToolCallStatus::Failed) {
-            tool_call.content.iter().find_map(|content| {
-                if let ToolCallContent::ContentBlock(block) = content {
-                    if let acp_thread::ContentBlock::Markdown { markdown } = block {
-                        let source = markdown.read(cx).source().to_string();
-                        if !source.is_empty() {
-                            if source == "User canceled" {
-                                return None;
-                            } else {
-                                return Some(SharedString::from(source));
-                            }
+            tool_call.content().iter().find_map(|content| {
+                if let ToolCallContent::ContentBlock { block, .. } = content {
+                    if let Some(source) = block.text_content(cx).filter(|source| !source.is_empty())
+                    {
+                        if source == "User canceled" {
+                            return None;
+                        } else {
+                            return Some(SharedString::from(source));
                         }
                     }
                 }
@@ -7452,113 +11809,6 @@ impl ThreadView {
         } else {
             None
         }
-    }
-
-    fn render_rules_item(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let project_context = self
-            .as_native_thread(cx)?
-            .read(cx)
-            .project_context()
-            .read(cx);
-
-        let user_rules_text = if project_context.user_rules.is_empty() {
-            None
-        } else if project_context.user_rules.len() == 1 {
-            let user_rules = &project_context.user_rules[0];
-
-            match user_rules.title.as_ref() {
-                Some(title) => Some(format!("Using \"{title}\" user rule")),
-                None => Some("Using user rule".into()),
-            }
-        } else {
-            Some(format!(
-                "Using {} user rules",
-                project_context.user_rules.len()
-            ))
-        };
-
-        let first_user_rules_id = project_context
-            .user_rules
-            .first()
-            .map(|user_rules| user_rules.uuid.0);
-
-        let rules_files = project_context
-            .worktrees
-            .iter()
-            .filter_map(|worktree| worktree.rules_file.as_ref())
-            .collect::<Vec<_>>();
-
-        let rules_file_text = match rules_files.as_slice() {
-            &[] => None,
-            &[rules_file] => Some(format!(
-                "Using project {:?} file",
-                rules_file.path_in_worktree
-            )),
-            rules_files => Some(format!("Using {} project rules files", rules_files.len())),
-        };
-
-        if user_rules_text.is_none() && rules_file_text.is_none() {
-            return None;
-        }
-
-        let has_both = user_rules_text.is_some() && rules_file_text.is_some();
-
-        Some(
-            h_flex()
-                .px_2p5()
-                .child(
-                    Icon::new(IconName::Attach)
-                        .size(IconSize::XSmall)
-                        .color(Color::Disabled),
-                )
-                .when_some(user_rules_text, |parent, user_rules_text| {
-                    parent.child(
-                        h_flex()
-                            .id("user-rules")
-                            .ml_1()
-                            .mr_1p5()
-                            .child(
-                                Label::new(user_rules_text)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .truncate(),
-                            )
-                            .hover(|s| s.bg(cx.theme().colors().element_hover))
-                            .tooltip(Tooltip::text("View User Rules"))
-                            .on_click(move |_event, window, cx| {
-                                window.dispatch_action(
-                                    Box::new(OpenRulesLibrary {
-                                        prompt_to_select: first_user_rules_id,
-                                    }),
-                                    cx,
-                                )
-                            }),
-                    )
-                })
-                .when(has_both, |this| {
-                    this.child(
-                        Label::new("•")
-                            .size(LabelSize::XSmall)
-                            .color(Color::Disabled),
-                    )
-                })
-                .when_some(rules_file_text, |parent, rules_file_text| {
-                    parent.child(
-                        h_flex()
-                            .id("project-rules")
-                            .ml_1p5()
-                            .child(
-                                Label::new(rules_file_text)
-                                    .size(LabelSize::XSmall)
-                                    .color(Color::Muted),
-                            )
-                            .hover(|s| s.bg(cx.theme().colors().element_hover))
-                            .tooltip(Tooltip::text("View Project Rules"))
-                            .on_click(cx.listener(Self::handle_open_rules)),
-                    )
-                })
-                .into_any(),
-        )
     }
 
     fn tool_card_header_bg(&self, cx: &Context<Self>) -> Hsla {
@@ -7573,7 +11823,14 @@ impl ThreadView {
     }
 
     fn tool_name_font_size(&self) -> Rems {
-        rems_from_px(13.)
+        rems_from_px(13_f32)
+    }
+
+    fn provider_by_name(name: &SharedString, cx: &App) -> Option<Arc<dyn LanguageModelProvider>> {
+        LanguageModelRegistry::read_global(cx)
+            .providers()
+            .into_iter()
+            .find(|provider| provider.name().0 == *name)
     }
 
     pub(crate) fn render_thread_error(
@@ -7581,18 +11838,111 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
-        let content = match self.thread_error.as_ref()? {
+        let callout = match self.thread_error.as_ref()? {
             ThreadError::Other { message, .. } => {
                 self.render_any_thread_error(message.clone(), window, cx)
             }
             ThreadError::Refusal => self.render_refusal_error(cx),
+            ThreadError::DataRetentionConsentRequired => {
+                self.render_data_retention_consent_error(cx)
+            }
             ThreadError::AuthenticationRequired(error) => {
                 self.render_authentication_required_error(error.clone(), cx)
             }
-            ThreadError::PaymentRequired => self.render_payment_required_error(cx),
+            ThreadError::ZedPaymentRequired => self.render_zed_payment_required_error(cx),
+            ThreadError::RateLimitExceeded { provider } => self.render_error_callout(
+                "Rate Limit Reached",
+                format!(
+                    "{provider}'s rate limit was reached. Zed will retry automatically. \
+                    You can also wait a moment and try again."
+                )
+                .into(),
+                true,
+                true,
+                cx,
+            ),
+            ThreadError::ServerOverloaded { provider } => self.render_error_callout(
+                "Provider Unavailable",
+                format!(
+                    "{provider}'s servers are temporarily unavailable. Zed will retry \
+                    automatically. If the problem persists, check the provider's status page."
+                )
+                .into(),
+                true,
+                true,
+                cx,
+            ),
+            ThreadError::PromptTooLarge => self.render_prompt_too_large_error(cx),
+            ThreadError::NoCredentials { provider } => {
+                let message = Self::provider_by_name(provider, cx)
+                    .map(|provider| provider.missing_credentials_error_message())
+                    .unwrap_or_else(|| {
+                        format!("No credentials are configured for {provider}.").into()
+                    });
+                self.render_error_callout("Credentials Missing", message, false, true, cx)
+            }
+            ThreadError::StreamError { provider } => self.render_error_callout(
+                "Connection Interrupted",
+                format!(
+                    "The connection to {provider}'s API was interrupted. Zed will retry \
+                    automatically. If the problem persists, check your network connection."
+                )
+                .into(),
+                true,
+                true,
+                cx,
+            ),
+            ThreadError::AuthenticationFailed { provider } => {
+                let message = Self::provider_by_name(provider, cx)
+                    .map(|provider| provider.authentication_error_message())
+                    .unwrap_or_else(|| format!("Could not authenticate with {provider}.").into());
+                self.render_error_callout("Authentication Failed", message, false, false, cx)
+            }
+            ThreadError::PermissionDenied { provider, message } => {
+                let message: SharedString = message.clone().unwrap_or_else(|| {
+                    format!("{provider} rejected the request due to insufficient permissions.")
+                        .into()
+                });
+
+                self.render_error_callout("Permission Denied", message, false, false, cx)
+            }
+            ThreadError::ProviderRejection { message } => {
+                self.render_error_callout("Request Failed", message.clone(), true, false, cx)
+            }
+            ThreadError::MaxOutputTokens => self.render_error_callout(
+                "Output Limit Reached",
+                "The model stopped because it reached its maximum output length. \
+                You can ask it to continue where it left off."
+                    .into(),
+                false,
+                false,
+                cx,
+            ),
+            ThreadError::NoModelSelected => self
+                .render_model_not_available_error(cx)
+                .unwrap_or_else(|| {
+                    self.render_error_callout(
+                        "No Model Selected",
+                        "Select a model from the model picker below to get started.".into(),
+                        false,
+                        false,
+                        cx,
+                    )
+                }),
+            ThreadError::ApiError { provider } => self.render_error_callout(
+                "API Error",
+                format!(
+                    "{provider}'s API returned an unexpected error. \
+                    If the problem persists, try switching models or restarting Zed."
+                )
+                .into(),
+                true,
+                true,
+                cx,
+            ),
         };
 
-        Some(div().child(content))
+        Some(div().child(callout.border_position(self.callout_border_position())))
     }
 
     fn render_refusal_error(&self, cx: &mut Context<'_, Self>) -> Callout {
@@ -7632,7 +11982,7 @@ impl ThreadView {
             .dismiss_action(self.dismiss_error_button(cx))
     }
 
-    fn render_payment_required_error(&self, cx: &mut Context<Self>) -> Callout {
+    fn render_zed_payment_required_error(&self, cx: &mut Context<Self>) -> Callout {
         const ERROR_MESSAGE: &str =
             "You reached your free usage limit. Upgrade to Zed Pro for more prompts.";
 
@@ -7648,6 +11998,167 @@ impl ThreadView {
                     .child(self.create_copy_button(ERROR_MESSAGE)),
             )
             .dismiss_action(self.dismiss_error_button(cx))
+    }
+
+    fn render_error_callout(
+        &self,
+        title: &'static str,
+        message: SharedString,
+        show_retry: bool,
+        show_copy: bool,
+        cx: &mut Context<Self>,
+    ) -> Callout {
+        let can_resume = show_retry && self.thread.read(cx).can_retry(cx);
+        let show_actions = can_resume || show_copy;
+
+        Callout::new()
+            .severity(Severity::Error)
+            .icon(IconName::XCircle)
+            .title(title)
+            .description(message.clone())
+            .when(show_actions, |callout| {
+                callout.actions_slot(
+                    h_flex()
+                        .gap_0p5()
+                        .when(can_resume, |this| this.child(self.retry_button(cx)))
+                        .when(show_copy, |this| {
+                            this.child(self.create_copy_button(message.clone()))
+                        }),
+                )
+            })
+            .dismiss_action(self.dismiss_error_button(cx))
+    }
+
+    fn render_model_not_available_error(&self, cx: &mut Context<Self>) -> Option<Callout> {
+        let thread = self.as_native_thread(cx)?;
+
+        let has_authenticated_provider =
+            LanguageModelRegistry::read_global(cx).has_authenticated_provider(cx);
+
+        let (title, description): (SharedString, SharedString) =
+            match thread.read(cx).thread_model() {
+                agent::ThreadModel::Ready(_) => return None,
+                agent::ThreadModel::Unresolved(selected_model) => {
+                    if let Some(provider) = LanguageModelRegistry::global(cx)
+                        .read(cx)
+                        .provider(&&selected_model.provider)
+                    {
+                        if !provider.is_authenticated(cx) {
+                            (
+                                format!("Failed to authenticate with {} provider", provider.name())
+                                    .into(),
+                                "Open the settings to configure the selected provider".into(),
+                            )
+                        } else {
+                            (
+                                format!("Model {} was not found", selected_model.model.0).into(),
+                                "You may need to reconfigure authentication for this provider"
+                                    .into(),
+                            )
+                        }
+                    } else {
+                        (
+                            format!("Provider {} was not found", selected_model.provider).into(),
+                            "Open the settings to configure providers".into(),
+                        )
+                    }
+                }
+                agent::ThreadModel::Unset => {
+                    if has_authenticated_provider {
+                        (
+                            "No model selected".into(),
+                            "Choose a different model or configure other providers to get started"
+                                .into(),
+                        )
+                    } else {
+                        (
+                            "No model selected".into(),
+                            "Configure a provider to get started".into(),
+                        )
+                    }
+                }
+            };
+
+        let callout = Callout::new()
+            .severity(Severity::Error)
+            .icon(IconName::XCircle)
+            .title(title)
+            .description(description)
+            .actions_slot(
+                h_flex()
+                    .gap_1()
+                    .child(self.open_llm_providers_settings_button(cx))
+                    .when(has_authenticated_provider, |this| {
+                        this.child(self.open_model_selector_button(cx))
+                    }),
+            )
+            .dismiss_action(self.dismiss_error_button(cx));
+
+        Some(callout)
+    }
+
+    fn open_llm_providers_settings_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("configure-llm-provider", "Configure Provider")
+            .label_size(LabelSize::Small)
+            .style(ButtonStyle::Filled)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.clear_thread_error(cx);
+                window.dispatch_action(
+                    Box::new(zed_actions::OpenSettingsAt {
+                        path: "llm_providers".to_string(),
+                        target: None,
+                    }),
+                    cx,
+                );
+            }))
+    }
+
+    fn open_model_selector_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("open-model-selector", "Select Model")
+            .label_size(LabelSize::Small)
+            .style(ButtonStyle::Filled)
+            .key_binding(KeyBinding::for_action(&ToggleModelSelector, cx))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.clear_thread_error(cx);
+                window.dispatch_action(ToggleModelSelector.boxed_clone(), cx);
+            }))
+    }
+
+    fn render_prompt_too_large_error(&self, cx: &mut Context<Self>) -> Callout {
+        const MESSAGE: &str = "This conversation is too long for the model's context window. \
+            Start a new thread or remove some attached files to continue.";
+
+        Callout::new()
+            .severity(Severity::Error)
+            .icon(IconName::XCircle)
+            .title("Context Too Large")
+            .description(MESSAGE)
+            .actions_slot(
+                h_flex()
+                    .gap_0p5()
+                    .child(self.new_thread_button(cx))
+                    .child(self.create_copy_button(MESSAGE)),
+            )
+            .dismiss_action(self.dismiss_error_button(cx))
+    }
+
+    fn retry_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("retry", "Retry")
+            .label_size(LabelSize::Small)
+            .style(ButtonStyle::Filled)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.retry_generation(cx);
+            }))
+    }
+
+    fn new_thread_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("new_thread", "New Thread")
+            .label_size(LabelSize::Small)
+            .style(ButtonStyle::Filled)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.clear_thread_error(cx);
+                window.dispatch_action(NewThread.boxed_clone(), cx);
+            }))
     }
 
     fn upgrade_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -7669,12 +12180,40 @@ impl ThreadView {
             .on_click(cx.listener({
                 move |this, _, window, cx| {
                     let server_view = this.server_view.clone();
-                    let agent_name = this.agent_id.clone();
 
                     this.clear_thread_error(cx);
-                    if let Some(message) = this.in_flight_prompt.take() {
+                    if let Some(message) = this.in_flight_prompt(cx) {
+                        if !message.iter().all(acp_thread::content::can_convert_to_v1)
+                            || this.message_editor.read(cx).editor().read(cx).read_only(cx)
+                        {
+                            this.handle_thread_error(
+                                anyhow!(
+                                    "This saved submission cannot be restored into the composer. The original submission and draft have been kept."
+                                ),
+                                cx,
+                            );
+                            return;
+                        }
+                        if !this.thread.read(cx).uses_reported_activity()
+                            && let Some(submission_id) = this.current_submission
+                            && this.thread.read(cx).submission(submission_id).is_some_and(
+                                |record| {
+                                    matches!(
+                                        record.state,
+                                        SubmissionState::Completed
+                                            | SubmissionState::Failed(_)
+                                            | SubmissionState::Cancelled
+                                    )
+                                },
+                            )
+                        {
+                            this.thread.update(cx, |thread, cx| {
+                                thread.forget_submission(submission_id, cx);
+                            });
+                            this.current_submission = None;
+                        }
                         this.message_editor.update(cx, |editor, cx| {
-                            editor.set_message(message, window, cx);
+                            editor.set_message(message.to_vec(), window, cx);
                         });
                     }
                     let connection = this.thread.read(cx).connection().clone();
@@ -7682,7 +12221,6 @@ impl ThreadView {
                         ConversationView::handle_auth_required(
                             server_view,
                             AuthRequired::new(),
-                            agent_name,
                             connection,
                             window,
                             cx,
@@ -7690,6 +12228,11 @@ impl ThreadView {
                     })
                 }
             }))
+            .map(|button| {
+                div()
+                    .debug_selector(|| "authenticate-submission".into())
+                    .child(button)
+            })
     }
 
     fn current_model_name(&self, cx: &App) -> SharedString {
@@ -7727,7 +12270,7 @@ impl ThreadView {
         let markdown_style =
             MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_muted_text(cx);
         let description = self
-            .render_markdown(markdown, markdown_style)
+            .render_markdown(markdown, markdown_style, cx)
             .into_any_element();
 
         Callout::new()
@@ -7753,10 +12296,25 @@ impl ThreadView {
             .dismiss_action(self.dismiss_error_button(cx))
     }
 
-    fn render_markdown(&self, markdown: Entity<Markdown>, style: MarkdownStyle) -> MarkdownElement {
-        let workspace = self.workspace.clone();
-        MarkdownElement::new(markdown, style).on_url_click(move |text, window, cx| {
-            open_link(text, &workspace, window, cx);
+    fn render_markdown(
+        &self,
+        markdown: Entity<Markdown>,
+        style: MarkdownStyle,
+        cx: &App,
+    ) -> MarkdownElement {
+        let list_state = self.list_state.clone();
+        render_agent_markdown(
+            markdown,
+            style,
+            &self.workspace,
+            &self.code_span_resolver,
+            cx,
+        )
+        // Zooming a diagram grows/shrinks its block; pause tail-following so the
+        // viewport stays put instead of snapping back to the bottom. The list
+        // resumes following on its own once the content returns to the bottom.
+        .on_mermaid_zoom(move |_window, _cx| {
+            list_state.pause_following_tail();
         })
     }
 
@@ -7781,123 +12339,18 @@ impl ThreadView {
     fn render_resume_notice(_cx: &Context<Self>) -> AnyElement {
         let description = "This agent does not support viewing previous messages. However, your session will still continue from where you last left off.";
 
-        div()
-            .px_2()
-            .pt_2()
-            .pb_3()
-            .w_full()
-            .child(
-                Callout::new()
-                    .severity(Severity::Info)
-                    .icon(IconName::Info)
-                    .title("Resumed Session")
-                    .description(description),
-            )
+        Callout::new()
+            .border_position(CalloutBorderPosition::Bottom)
+            .severity(Severity::Info)
+            .icon(IconName::Info)
+            .title("Resumed Session")
+            .description(description)
             .into_any_element()
-    }
-
-    fn update_recent_history_from_cache(
-        &mut self,
-        history: &Entity<ThreadHistory>,
-        cx: &mut Context<Self>,
-    ) {
-        self.recent_history_entries = history.read(cx).get_recent_sessions(3);
-        self.hovered_recent_history_item = None;
-        cx.notify();
-    }
-
-    fn render_empty_state_section_header(
-        &self,
-        label: impl Into<SharedString>,
-        action_slot: Option<AnyElement>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div().pl_1().pr_1p5().child(
-            h_flex()
-                .mt_2()
-                .pl_1p5()
-                .pb_1()
-                .w_full()
-                .justify_between()
-                .border_b_1()
-                .border_color(cx.theme().colors().border_variant)
-                .child(
-                    Label::new(label.into())
-                        .size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-                .children(action_slot),
-        )
-    }
-
-    fn render_recent_history(&self, cx: &mut Context<Self>) -> AnyElement {
-        let render_history = !self.recent_history_entries.is_empty();
-
-        v_flex()
-            .size_full()
-            .when(render_history, |this| {
-                let recent_history = self.recent_history_entries.clone();
-                this.justify_end().child(
-                    v_flex()
-                        .child(
-                            self.render_empty_state_section_header(
-                                "Recent",
-                                Some(
-                                    Button::new("view-history", "View All")
-                                        .style(ButtonStyle::Subtle)
-                                        .label_size(LabelSize::Small)
-                                        .key_binding(
-                                            KeyBinding::for_action_in(
-                                                &OpenHistory,
-                                                &self.focus_handle(cx),
-                                                cx,
-                                            )
-                                            .map(|kb| kb.size(rems_from_px(12.))),
-                                        )
-                                        .on_click(move |_event, window, cx| {
-                                            window.dispatch_action(OpenHistory.boxed_clone(), cx);
-                                        })
-                                        .into_any_element(),
-                                ),
-                                cx,
-                            ),
-                        )
-                        .child(v_flex().p_1().pr_1p5().gap_1().children({
-                            let supports_delete = self
-                                .history
-                                .as_ref()
-                                .map_or(false, |h| h.read(cx).supports_delete());
-                            recent_history
-                                .into_iter()
-                                .enumerate()
-                                .map(move |(index, entry)| {
-                                    // TODO: Add keyboard navigation.
-                                    let is_hovered =
-                                        self.hovered_recent_history_item == Some(index);
-                                    crate::thread_history_view::HistoryEntryElement::new(
-                                        entry,
-                                        self.server_view.clone(),
-                                    )
-                                    .hovered(is_hovered)
-                                    .supports_delete(supports_delete)
-                                    .on_hover(cx.listener(move |this, is_hovered, _window, cx| {
-                                        if *is_hovered {
-                                            this.hovered_recent_history_item = Some(index);
-                                        } else if this.hovered_recent_history_item == Some(index) {
-                                            this.hovered_recent_history_item = None;
-                                        }
-                                        cx.notify();
-                                    }))
-                                    .into_any_element()
-                                })
-                        })),
-                )
-            })
-            .into_any()
     }
 
     fn render_codex_windows_warning(&self, cx: &mut Context<Self>) -> Callout {
         Callout::new()
+            .border_position(self.callout_border_position())
             .icon(IconName::Warning)
             .severity(Severity::Warning)
             .title("Codex on Windows")
@@ -7928,16 +12381,219 @@ impl ThreadView {
             )
     }
 
-    fn render_external_source_prompt_warning(&self, cx: &mut Context<Self>) -> Callout {
-        Callout::new()
+    fn render_session_notices(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let notices = self.thread.read(cx).notices();
+        if notices.is_empty() {
+            return None;
+        }
+
+        Some(
+            crate::ui::session_notice_list("session-notices")
+                .debug_selector(|| "session-notices".into())
+                .children(notices.iter().map(|(notice_id, notice)| {
+                    let notice_id = *notice_id;
+                    let thread = self.thread.clone();
+                    let focus_handle = self.activation_focus_handle(cx);
+                    crate::ui::SessionNotice::new(
+                        ("session-notice", notice_id),
+                        notice,
+                        move |event, window, cx| {
+                            thread.update(cx, |thread, cx| {
+                                thread.dismiss_notice(notice_id, cx);
+                            });
+                            if event.is_keyboard() {
+                                focus_handle.focus(window, cx);
+                            }
+                        },
+                    )
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn render_skill_loading_issues(&self, cx: &mut Context<Self>) -> Vec<Callout> {
+        let border_position = self.callout_border_position();
+
+        let description_warnings = self
+            .skill_loading_issues
+            .iter()
+            .filter(|issue| issue.kind == SkillLoadingIssueKind::DescriptionTooLong)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let long_description_warning =
+            self.render_skill_description_warnings(description_warnings, cx);
+
+        let other_warnings = self
+            .skill_loading_issues
+            .iter()
+            .filter(|issue| issue.kind != SkillLoadingIssueKind::DescriptionTooLong)
+            .enumerate()
+            .map(|(index, issue)| {
+                let abs_path = issue.path.clone();
+                let workspace = self.workspace.clone();
+                let path_label = issue.path.display().to_string();
+                let target = issue.clone();
+
+                let title = match issue.kind {
+                    SkillLoadingIssueKind::LoadFailed => "Skill Failed to Load",
+                    SkillLoadingIssueKind::DescriptionTooLong => unreachable!(),
+                    SkillLoadingIssueKind::CatalogBudgetExceeded => {
+                        "Skill Omitted from Model Catalog"
+                    }
+                };
+
+                Callout::new()
+                    .icon(IconName::Warning)
+                    .severity(Severity::Warning)
+                    .title(title)
+                    .description(format!("{}\n{path_label}", issue.message))
+                    .actions_slot(
+                        Button::new(("open-skill-file", index), "Open Skill")
+                            .style(ButtonStyle::Outlined)
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |_, _, window, cx| {
+                                let abs_path = abs_path.clone();
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        workspace
+                                            .open_abs_path(
+                                                abs_path,
+                                                workspace::OpenOptions::default(),
+                                                window,
+                                                cx,
+                                            )
+                                            .detach_and_log_err(cx);
+                                    })
+                                    .ok();
+                            })),
+                    )
+                    .dismiss_action(
+                        IconButton::new(("dismiss-skill-issue", index), IconName::Close)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Dismiss"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.skill_loading_issues.retain(|issue| *issue != target);
+                                this.dismissed_skill_loading_issues.insert(target.clone());
+                                cx.notify();
+                            })),
+                    )
+            })
+            .collect::<Vec<_>>();
+
+        long_description_warning
+            .into_iter()
+            .chain(other_warnings)
+            .map(|callout| callout.border_position(border_position))
+            .collect()
+    }
+
+    fn render_skill_description_warnings(
+        &self,
+        description_warnings: Vec<SkillLoadingIssue>,
+        cx: &mut Context<Self>,
+    ) -> Option<Callout> {
+        if description_warnings.is_empty() {
+            return None;
+        }
+
+        let warning_count = description_warnings.len();
+        let title = if warning_count == 1 {
+            "1 Skill Loaded with a Long Description".to_string()
+        } else {
+            format!("{warning_count} Skills Loaded with Long Descriptions")
+        };
+
+        let rows = description_warnings
+            .iter()
+            .enumerate()
+            .map(|(index, issue)| {
+                let abs_path = issue.path.clone();
+                let workspace = self.workspace.clone();
+                let full_path = issue.path.display().to_string();
+                let file_label = skill_issue_file_label(&issue.path);
+
+                ButtonLike::new(("skill-description-warning-file", index))
+                    .full_width()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_1()
+                            .child(
+                                Icon::new(IconName::Dash)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(Label::new(file_label).size(LabelSize::Small)),
+                    )
+                    .tooltip(move |_, cx| {
+                        Tooltip::with_meta("Open Skill", None, full_path.clone(), cx)
+                    })
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        let abs_path = abs_path.clone();
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace
+                                    .open_abs_path(
+                                        abs_path,
+                                        workspace::OpenOptions::default(),
+                                        window,
+                                        cx,
+                                    )
+                                    .detach_and_log_err(cx);
+                            })
+                            .ok();
+                    }))
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        let callout = Callout::new()
             .icon(IconName::Warning)
             .severity(Severity::Warning)
-            .title("Review before sending")
-            .description("This prompt was pre-filled by an external link. Read it carefully before you send it.")
+            .title(title)
+            .description_slot(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        Label::new(format!(
+                            "Ensure skill descriptions are at most {MAX_SKILL_DESCRIPTION_LEN} characters; longer ones may consume more model-context tokens."
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .children(rows),
+            );
+
+        let targets = description_warnings;
+
+        Some(
+            callout.dismiss_action(
+                IconButton::new("dismiss-skill-description-warnings", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Dismiss"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.skill_loading_issues
+                            .retain(|issue| !targets.contains(issue));
+                        for target in &targets {
+                            this.dismissed_skill_loading_issues.insert(target.clone());
+                        }
+                        cx.notify();
+                    })),
+            ),
+        )
+    }
+
+    fn render_external_source_prompt_warning(&self, cx: &mut Context<Self>) -> Callout {
+        Callout::new()
+            .border_position(self.callout_border_position())
+            .icon(IconName::Warning)
+            .severity(Severity::Warning)
+            .title("Review Before Sending")
+            .description("This prompt was pre-filled by an external link. Read it carefully before you submit it to the model.")
             .dismiss_action(
                 IconButton::new("dismiss-external-source-prompt-warning", IconName::Close)
                     .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted)
                     .tooltip(Tooltip::text("Dismiss Warning"))
                     .on_click(cx.listener({
                         move |this, _, _, cx| {
@@ -7948,15 +12604,81 @@ impl ThreadView {
             )
     }
 
+    fn render_multi_root_callout(&self, cx: &mut Context<Self>) -> Option<Callout> {
+        if self.multi_root_callout_dismissed {
+            return None;
+        }
+
+        if self.as_native_connection(cx).is_some() {
+            return None;
+        }
+
+        if self
+            .thread
+            .read(cx)
+            .connection()
+            .supports_session_additional_directories()
+        {
+            return None;
+        }
+
+        let project = self.project.upgrade()?;
+        let worktree_count = project.read(cx).visible_worktrees(cx).count();
+        if worktree_count <= 1 {
+            return None;
+        }
+
+        let work_dirs = self.thread.read(cx).work_dirs()?;
+        let active_dir = work_dirs
+            .ordered_paths()
+            .next()
+            .and_then(|p| p.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "one folder".to_string());
+
+        Some(
+            Callout::new()
+                .severity(Severity::Warning)
+                .icon(IconName::Warning)
+                .title("This agent doesn't currently support multi-root workspaces")
+                .description(format!(
+                    "It currently only operates by default on \"{}\".",
+                    active_dir
+                ))
+                .border_position(self.callout_border_position())
+                .dismiss_action(
+                    IconButton::new("dismiss-multi-root-callout", IconName::Close)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Dismiss"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.multi_root_callout_dismissed = true;
+                            cx.notify();
+                        })),
+                ),
+        )
+    }
+
     fn render_new_version_callout(&self, version: &SharedString, cx: &mut Context<Self>) -> Div {
         let server_view = self.server_view.clone();
+        let has_version = !version.is_empty();
+        let title = if has_version {
+            "New Version Available"
+        } else {
+            "Agent Update Available"
+        };
+        let button_label = if has_version {
+            format!("Update to v{}", version)
+        } else {
+            "Reconnect".to_string()
+        };
+
         v_flex().w_full().justify_end().child(
             h_flex()
                 .p_2()
                 .pr_3()
                 .w_full()
                 .gap_1p5()
-                .border_t_1()
+                .border_b_1()
                 .border_color(cx.theme().colors().border)
                 .bg(cx.theme().colors().element_background)
                 .child(
@@ -7968,10 +12690,10 @@ impl ThreadView {
                                 .color(Color::Accent)
                                 .size(IconSize::Small),
                         )
-                        .child(Label::new("New version available").size(LabelSize::Small)),
+                        .child(Label::new(title).size(LabelSize::Small)),
                 )
                 .child(
-                    Button::new("update-button", format!("Update to v{}", version))
+                    Button::new("update-button", button_label)
                         .label_size(LabelSize::Small)
                         .style(ButtonStyle::Tinted(TintColor::Accent))
                         .on_click(move |_, window, cx| {
@@ -7984,11 +12706,21 @@ impl ThreadView {
     }
 
     fn render_token_limit_callout(&self, cx: &mut Context<Self>) -> Option<Callout> {
-        if self.token_limit_callout_dismissed {
+        if self.token_limit_callout_dismissed || self.as_native_thread(cx).is_none() {
             return None;
         }
 
         let token_usage = self.thread.read(cx).token_usage()?;
+
+        // When auto-compaction is available (the model's context window is large
+        // enough), the thread is compacted automatically before it reaches the
+        // limit, so there's no need to warn the user. Models with a context
+        // window that's too small can't be auto-compacted, so we fall back to
+        // the normal warning.
+        if token_usage.max_tokens >= agent::MIN_COMPACTION_CONTEXT_WINDOW {
+            return None;
+        }
+
         let ratio = token_usage.ratio();
 
         let (severity, icon, title) = match ratio {
@@ -8005,10 +12737,11 @@ impl ThreadView {
             ),
         };
 
-        let description = "To continue, start a new thread from a summary.";
+        let description = "To continue, run /compact or start a new thread and @-mention this one";
 
         Some(
             Callout::new()
+                .border_position(self.callout_border_position())
                 .severity(severity)
                 .icon(icon)
                 .title(title)
@@ -8031,6 +12764,118 @@ impl ThreadView {
                 )
                 .dismiss_action(self.dismiss_error_button(cx)),
         )
+    }
+
+    /// Returns the model to offer as a downgrade target when the current model
+    /// requires data retention consent (e.g. Opus 4.8 for Fable).
+    fn data_retention_fallback_model(&self, cx: &App) -> Option<LanguageModel> {
+        let thread = self.as_native_thread(cx)?;
+        let model = thread.read(cx).model()?.clone();
+        let fallback_id = model.refusal_fallback_model_id()?;
+        LanguageModelRegistry::read_global(cx)
+            .available_models(cx)
+            .find(|fallback| {
+                fallback.provider_id() == model.provider_id()
+                    && fallback.id().0.as_ref() == fallback_id
+            })
+    }
+
+    fn render_data_retention_consent_error(&self, cx: &mut Context<Self>) -> Callout {
+        let fallback_model = self.data_retention_fallback_model(cx);
+
+        Callout::new()
+            .severity(Severity::Warning)
+            .icon(IconName::Warning)
+            .title(format!(
+                "Note: {} cannot be offered with Zero Data Retention.",
+                self.current_model_name(cx)
+            ))
+            .description_slot(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        Label::new("Anthropic will retain inference logs.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Button::new("data-retention-learn-more", "Learn More")
+                            .label_size(LabelSize::Small)
+                            .on_click(|_, _, cx| {
+                                cx.open_url(DATA_RETENTION_LEARN_MORE_URL);
+                            }),
+                    ),
+            )
+            .actions_slot(
+                h_flex()
+                    .gap_0p5()
+                    .when_some(fallback_model, |this, fallback| {
+                        this.child(
+                            Button::new(
+                                "switch-data-retention-fallback",
+                                format!("Switch to {}", fallback.name().0),
+                            )
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.switch_to_data_retention_fallback_and_resend(cx);
+                            })),
+                        )
+                    })
+                    .child(
+                        Button::new("accept-data-retention", "Accept")
+                            .label_size(LabelSize::Small)
+                            .style(ButtonStyle::Tinted(TintColor::Warning))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.accept_data_retention_and_resend(cx);
+                            })),
+                    ),
+            )
+            .dismiss_action(self.dismiss_error_button(cx))
+    }
+
+    fn accept_data_retention_and_resend(&mut self, cx: &mut Context<Self>) {
+        let fs = self.thread.read(cx).project().read(cx).fs().clone();
+        // Resume the failed turn only once the in-memory settings reflect
+        // consent, otherwise the resent request would be rejected again.
+        let completion = update_settings_file_with_completion(fs, cx, |settings, _| {
+            settings
+                .telemetry
+                .get_or_insert_default()
+                .anthropic_retention = Some(true);
+        });
+        cx.spawn(async move |this, cx| {
+            completion.await??;
+            this.update(cx, |this, cx| this.retry_generation(cx))?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    fn switch_to_data_retention_fallback_and_resend(&mut self, cx: &mut Context<Self>) {
+        let Some(fallback) = self.data_retention_fallback_model(cx) else {
+            return;
+        };
+        let model_id = acp_thread::AgentModelId::new(format!(
+            "{}/{}",
+            fallback.provider_id().0,
+            fallback.id().0
+        ));
+        let session_id = self.thread.read(cx).session_id().clone();
+        let Some(selector) = self
+            .thread
+            .read(cx)
+            .connection()
+            .model_selector(&session_id)
+        else {
+            return;
+        };
+        let select = selector.select_model(model_id, cx);
+        cx.spawn(async move |this, cx| {
+            select.await?;
+            this.update(cx, |this, cx| this.retry_generation(cx))?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn open_permission_dropdown(
@@ -8057,25 +12902,56 @@ impl ThreadView {
         });
     }
 
-    fn toggle_fast_mode(&mut self, cx: &mut Context<Self>) {
+    fn toggle_fast_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.fast_mode_available(cx) {
             return;
         }
+
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
+
+        let current_speed = thread.read(cx).speed().unwrap_or_default();
+        let new_speed = current_speed.toggle();
+
+        if new_speed == Speed::Fast && self.pending_fast_mode_confirmation(cx).is_some() {
+            let menu_handle = self.fast_mode_menu_handle.clone();
+            window.defer(cx, move |window, cx| {
+                menu_handle.toggle(window, cx);
+            });
+            return;
+        }
+
+        self.apply_fast_mode_speed(new_speed, cx);
+    }
+
+    fn apply_fast_mode_speed(&mut self, new_speed: Speed, cx: &mut Context<Self>) {
         let Some(thread) = self.as_native_thread(cx) else {
             return;
         };
         thread.update(cx, |thread, cx| {
-            thread.set_speed(
-                thread
-                    .speed()
-                    .map(|speed| speed.toggle())
-                    .unwrap_or(Speed::Fast),
-                cx,
-            );
+            thread.set_speed(new_speed, cx);
+
+            let favorite_key = thread
+                .model()
+                .map(|model| (model.provider_id().0.to_string(), model.id().0.to_string()));
+            let fs = thread.project().read(cx).fs().clone();
+            update_settings_file(fs, cx, move |settings, _| {
+                if let Some(agent) = settings.agent.as_mut() {
+                    if let Some(default_model) = agent.default_model.as_mut() {
+                        default_model.speed = Some(new_speed);
+                    }
+                    if let Some((provider_id, model_id)) = &favorite_key {
+                        agent.update_favorite_model(provider_id, model_id, |favorite| {
+                            favorite.speed = Some(new_speed)
+                        });
+                    }
+                }
+            });
         });
     }
 
-    fn cycle_thinking_effort(&mut self, cx: &mut Context<Self>) {
+    fn cycle_native_agent_thinking_effort(&mut self, cx: &mut Context<Self>) {
         let Some(thread) = self.as_native_thread(cx) else {
             return;
         };
@@ -8110,50 +12986,49 @@ impl ThreadView {
         thread.update(cx, |thread, cx| {
             thread.set_thinking_effort(Some(next_effort.clone()), cx);
 
+            let favorite_key = thread
+                .model()
+                .map(|model| (model.provider_id().0.to_string(), model.id().0.to_string()));
             let fs = thread.project().read(cx).fs().clone();
             update_settings_file(fs, cx, move |settings, _| {
-                if let Some(agent) = settings.agent.as_mut()
-                    && let Some(default_model) = agent.default_model.as_mut()
-                {
-                    default_model.effort = Some(next_effort);
+                if let Some(agent) = settings.agent.as_mut() {
+                    if let Some(default_model) = agent.default_model.as_mut() {
+                        default_model.effort = Some(next_effort.clone());
+                    }
+                    if let Some((provider_id, model_id)) = &favorite_key {
+                        agent.update_favorite_model(provider_id, model_id, |favorite| {
+                            favorite.effort = Some(next_effort)
+                        });
+                    }
                 }
             });
-        });
-    }
-
-    fn toggle_thinking_effort_menu(
-        &mut self,
-        _action: &ToggleThinkingEffortMenu,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let menu_handle = self.thinking_effort_menu_handle.clone();
-        window.defer(cx, move |window, cx| {
-            menu_handle.toggle(window, cx);
         });
     }
 }
 
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Keep the message editor's local slash commands in sync with the
+        // current availability of feedback/sharing, which can change between
+        // renders (settings, connection state, feature flags).
+        self.sync_local_commands(cx);
+
         let has_messages = self.list_state.item_count() > 0;
-        let v2_empty_state = cx.has_flag::<AgentV2FeatureFlag>() && !has_messages;
+        let list_state = self.list_state.clone();
 
         let conversation = v_flex()
-            .when(!v2_empty_state, |this| this.flex_1())
+            .when(self.resumed_without_history, |this| {
+                this.child(Self::render_resume_notice(cx))
+            })
             .map(|this| {
-                let this = this.when(self.resumed_without_history, |this| {
-                    this.child(Self::render_resume_notice(cx))
-                });
                 if has_messages {
-                    let list_state = self.list_state.clone();
-                    this.child(self.render_entries(cx))
+                    this.flex_1()
+                        .size_full()
+                        .child(self.render_entries(cx))
                         .vertical_scrollbar_for(&list_state, window, cx)
                         .into_any()
-                } else if v2_empty_state {
-                    this.into_any()
                 } else {
-                    this.child(self.render_recent_history(cx)).into_any()
+                    this.into_any()
                 }
             });
 
@@ -8161,15 +13036,98 @@ impl Render for ThreadView {
             .key_context("AcpThread")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &menu::Cancel, _, cx| {
-                if this.parent_id.is_none() {
+                if this.parent_session_id.is_none() {
                     this.cancel_generation(cx);
                 }
             }))
+            .on_action(cx.listener(
+                |this, _: &super::thread_search_bar::DismissThreadSearch, window, cx| {
+                    this.close_thread_search(window, cx);
+                },
+            ))
+            // Esc can arrive as `editor::Cancel` from the query editor.
+            .on_action(
+                cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
+                    if !this.close_thread_search(window, cx) {
+                        cx.propagate();
+                    }
+                }),
+            )
+            .on_action(cx.listener(
+                |this, action: &super::thread_search_bar::SelectNextThreadMatch, window, cx| {
+                    if !this.thread_search_visible {
+                        cx.propagate();
+                        return;
+                    }
+                    if let Some(bar) = this.thread_search_bar.clone() {
+                        bar.update(cx, |bar, cx| bar.select_next_match(action, window, cx));
+                    }
+                },
+            ))
+            .on_action(cx.listener(
+                |this, action: &super::thread_search_bar::SelectPreviousThreadMatch, window, cx| {
+                    if !this.thread_search_visible {
+                        cx.propagate();
+                        return;
+                    }
+                    if let Some(bar) = this.thread_search_bar.clone() {
+                        bar.update(cx, |bar, cx| bar.select_prev_match(action, window, cx));
+                    }
+                },
+            ))
+            .on_action(
+                cx.listener(|this, _: &search::ToggleCaseSensitive, window, cx| {
+                    if !this.thread_search_visible {
+                        cx.propagate();
+                        return;
+                    }
+                    if let Some(bar) = this.thread_search_bar.clone() {
+                        bar.update(cx, |bar, cx| {
+                            bar.toggle_case_sensitive(&search::ToggleCaseSensitive, window, cx)
+                        });
+                    }
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &search::ToggleWholeWord, window, cx| {
+                    if !this.thread_search_visible {
+                        cx.propagate();
+                        return;
+                    }
+                    if let Some(bar) = this.thread_search_bar.clone() {
+                        bar.update(cx, |bar, cx| {
+                            bar.toggle_whole_word(&search::ToggleWholeWord, window, cx)
+                        });
+                    }
+                }),
+            )
+            .on_action(cx.listener(|this, _: &search::ToggleRegex, window, cx| {
+                if !this.thread_search_visible {
+                    cx.propagate();
+                    return;
+                }
+                if let Some(bar) = this.thread_search_bar.clone() {
+                    bar.update(cx, |bar, cx| {
+                        bar.toggle_regex(&search::ToggleRegex, window, cx)
+                    });
+                }
+            }))
+            .on_action(
+                cx.listener(|this, action: &search::FocusSearch, window, cx| {
+                    if !this.thread_search_visible {
+                        cx.propagate();
+                        return;
+                    }
+                    if let Some(bar) = this.thread_search_bar.clone() {
+                        bar.update(cx, |bar, cx| bar.focus_search(action, window, cx));
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &workspace::GoBack, window, cx| {
-                if let Some(parent_session_id) = this.parent_id.clone() {
+                if let Some(parent_session_id) = this.thread.read(cx).parent_session_id().cloned() {
                     this.server_view
                         .update(cx, |view, cx| {
-                            view.navigate_to_session(parent_session_id, window, cx);
+                            view.navigate_to_thread(parent_session_id, window, cx);
                         })
                         .ok();
                 }
@@ -8185,8 +13143,17 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::handle_toggle_command_pattern))
             .on_action(cx.listener(Self::open_permission_dropdown))
             .on_action(cx.listener(Self::open_add_context_menu))
-            .on_action(cx.listener(|this, _: &ToggleFastMode, _window, cx| {
-                this.toggle_fast_mode(cx);
+            .on_action(cx.listener(Self::scroll_output_page_up))
+            .on_action(cx.listener(Self::scroll_output_page_down))
+            .on_action(cx.listener(Self::scroll_output_line_up))
+            .on_action(cx.listener(Self::scroll_output_line_down))
+            .on_action(cx.listener(Self::scroll_output_to_top))
+            .on_action(cx.listener(Self::scroll_output_to_bottom))
+            .on_action(cx.listener(Self::scroll_output_to_previous_message))
+            .on_action(cx.listener(Self::scroll_output_to_next_message))
+            .on_action(cx.listener(Self::toggle_search))
+            .on_action(cx.listener(|this, _: &ToggleFastMode, window, cx| {
+                this.toggle_fast_mode(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleThinkingMode, _window, cx| {
                 if this.thread.read(cx).status() != ThreadStatus::Idle {
@@ -8194,7 +13161,12 @@ impl Render for ThreadView {
                 }
                 if let Some(thread) = this.as_native_thread(cx) {
                     thread.update(cx, |thread, cx| {
-                        thread.set_thinking_enabled(!thread.thinking_enabled(), cx);
+                        let model_allows_disabling = thread
+                            .model()
+                            .is_none_or(|model| model.supports_disabling_thinking());
+                        if model_allows_disabling {
+                            thread.set_thinking_enabled(!thread.thinking_enabled(), cx);
+                        }
                     });
                 }
             }))
@@ -8202,40 +13174,77 @@ impl Render for ThreadView {
                 if this.thread.read(cx).status() != ThreadStatus::Idle {
                     return;
                 }
-                this.cycle_thinking_effort(cx);
+                if let Some(config_options_view) = this.config_options_view.clone() {
+                    let handled = config_options_view.update(cx, |view, cx| {
+                        view.cycle_category_option(
+                            acp_v2::SessionConfigOptionCategory::ThoughtLevel,
+                            false,
+                            cx,
+                        )
+                    });
+                    if handled {
+                        return;
+                    }
+                }
+                this.cycle_native_agent_thinking_effort(cx);
             }))
             .on_action(
-                cx.listener(|this, action: &ToggleThinkingEffortMenu, window, cx| {
+                cx.listener(|this, _: &ToggleThinkingEffortMenu, window, cx| {
                     if this.thread.read(cx).status() != ThreadStatus::Idle {
                         return;
                     }
-                    this.toggle_thinking_effort_menu(action, window, cx);
+                    if let Some(config_options_view) = this.config_options_view.clone() {
+                        let handled = config_options_view.update(cx, |view, cx| {
+                            view.toggle_category_picker(
+                                acp_v2::SessionConfigOptionCategory::ThoughtLevel,
+                                window,
+                                cx,
+                            )
+                        });
+                        if handled {
+                            return;
+                        }
+                    }
+                    let menu_handle = this.thinking_effort_menu_handle.clone();
+                    window.defer(cx, move |window, cx| {
+                        menu_handle.toggle(window, cx);
+                    });
                 }),
             )
             .on_action(cx.listener(|this, _: &SendNextQueuedMessage, window, cx| {
-                this.send_queued_message_at_index(0, true, window, cx);
+                if let Some(id) = this.message_queue.first_id() {
+                    this.send_queued_message_now(id, window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &RemoveFirstQueuedMessage, _, cx| {
-                this.remove_from_queue(0, cx);
-                cx.notify();
+                if let Some(id) = this.message_queue.first_id() {
+                    this.remove_from_queue(id, cx);
+                    cx.notify();
+                }
             }))
             .on_action(cx.listener(|this, _: &EditFirstQueuedMessage, window, cx| {
-                this.move_queued_message_to_main_editor(0, None, window, cx);
+                if let Some(id) = this.message_queue.first_id() {
+                    this.move_queued_message_to_main_editor(id, None, None, window, cx);
+                }
             }))
+            .on_action(
+                cx.listener(|this, _: &ToggleSteerFirstQueuedMessage, _, cx| {
+                    if this.as_native_thread(cx).is_none() {
+                        return;
+                    }
+                    if let Some(id) = this.message_queue.first_id() {
+                        this.toggle_queue_entry_steer(id, cx);
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &ClearMessageQueue, _, cx| {
-                this.local_queued_messages.clear();
-                this.sync_queue_flag_to_native_thread(cx);
-                this.can_fast_track_queue = false;
-                cx.notify();
+                this.clear_queue(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleProfileSelector, window, cx| {
-                if this.thread.read(cx).status() != ThreadStatus::Idle {
-                    return;
-                }
                 if let Some(config_options_view) = this.config_options_view.clone() {
                     let handled = config_options_view.update(cx, |view, cx| {
                         view.toggle_category_picker(
-                            acp::SessionConfigOptionCategory::Mode,
+                            acp_v2::SessionConfigOptionCategory::Mode,
                             window,
                             cx,
                         )
@@ -8258,7 +13267,7 @@ impl Render for ThreadView {
                 if let Some(config_options_view) = this.config_options_view.clone() {
                     let handled = config_options_view.update(cx, |view, cx| {
                         view.cycle_category_option(
-                            acp::SessionConfigOptionCategory::Mode,
+                            acp_v2::SessionConfigOptionCategory::Mode,
                             false,
                             cx,
                         )
@@ -8285,7 +13294,7 @@ impl Render for ThreadView {
                 if let Some(config_options_view) = this.config_options_view.clone() {
                     let handled = config_options_view.update(cx, |view, cx| {
                         view.toggle_category_picker(
-                            acp::SessionConfigOptionCategory::Model,
+                            acp_v2::SessionConfigOptionCategory::Model,
                             window,
                             cx,
                         )
@@ -8307,7 +13316,7 @@ impl Render for ThreadView {
                 if let Some(config_options_view) = this.config_options_view.clone() {
                     let handled = config_options_view.update(cx, |view, cx| {
                         view.cycle_category_option(
-                            acp::SessionConfigOptionCategory::Model,
+                            acp_v2::SessionConfigOptionCategory::Model,
                             true,
                             cx,
                         )
@@ -8325,15 +13334,30 @@ impl Render for ThreadView {
             }))
             .size_full()
             .children(self.render_subagent_titlebar(cx))
+            .when_some(
+                self.thread_search_visible
+                    .then(|| self.thread_search_bar.clone())
+                    .flatten(),
+                |this, bar| this.child(bar),
+            )
             .child(conversation)
+            .children(self.render_multi_root_callout(cx))
             .children(self.render_activity_bar(window, cx))
+            .when_some(
+                self.render_recoverable_submissions(cx),
+                |this, submissions| this.child(submissions),
+            )
+            .when_some(self.render_session_notices(cx), |this, notices| {
+                this.child(notices)
+            })
             .when(self.show_external_source_prompt_warning, |this| {
                 this.child(self.render_external_source_prompt_warning(cx))
             })
             .when(self.show_codex_windows_warning, |this| {
                 this.child(self.render_codex_windows_warning(cx))
             })
-            .children(self.render_thread_retry_status_callout())
+            .children(self.render_skill_loading_issues(cx))
+            .children(self.render_thread_retry_status_callout(cx))
             .children(self.render_thread_error(window, cx))
             .when_some(
                 match has_messages {
@@ -8343,6 +13367,7 @@ impl Render for ThreadView {
                 |this, version| this.child(self.render_new_version_callout(&version, cx)),
             )
             .children(self.render_token_limit_callout(cx))
+            .children(self.render_request_elicitations(cx))
             .child(self.render_message_editor(window, cx))
     }
 }
@@ -8354,25 +13379,168 @@ pub(crate) fn open_link(
     cx: &mut App,
 ) {
     let Some(workspace) = workspace.upgrade() else {
-        cx.open_url(&url);
         return;
     };
 
-    if let Some(mention) = MentionUri::parse(&url, workspace.read(cx).path_style(cx)).log_err() {
+    let path_style = workspace.read(cx).path_style(cx);
+    let path_url = url
+        .strip_prefix('`')
+        .and_then(|path| path.strip_suffix('`'))
+        .unwrap_or(&url);
+    if let Some((path, fragment)) = file_link_parts(path_url, path_style) {
+        if !path.is_empty() {
+            let fragment_point = fragment
+                .and_then(source_position_from_fragment)
+                .map(|(row, column)| Point::new(row, column));
+            let candidates = file_link_candidates(path, fragment_point, path_style);
+            let project = workspace.read(cx).project().downgrade();
+            let Ok((roots, root_names)) = project.read_with(cx, |project, cx| {
+                project
+                    .visible_worktrees(cx)
+                    .filter_map(|worktree| {
+                        let worktree = worktree.read(cx);
+                        (!worktree.is_single_file())
+                            .then(|| (worktree.abs_path(), worktree.root_name().to_owned()))
+                    })
+                    .unzip::<_, _, Vec<_>, Vec<_>>()
+            }) else {
+                return;
+            };
+            let workspace = workspace.downgrade();
+            window
+                .spawn(cx, async move |cx| {
+                    let mut target = None;
+                    let mut failures = Vec::new();
+                    'resolve: for (path, point) in candidates {
+                        let Ok(project_path) = project.read_with(cx, |project, cx| {
+                            project_path_for_file_link(project, &path, cx)
+                        }) else {
+                            return Ok(());
+                        };
+                        if let Some(project_path) = project_path {
+                            target = Some((
+                                ResolvedPath::ProjectPath {
+                                    project_path,
+                                    is_dir: false,
+                                },
+                                point,
+                            ));
+                            break;
+                        }
+                        let paths = if path_style.is_absolute(&path.to_string_lossy())
+                            || path.starts_with("~")
+                        {
+                            vec![path]
+                        } else {
+                            roots
+                                .iter()
+                                .zip(&root_names)
+                                .flat_map(|(root, root_name)| {
+                                    [
+                                        path.strip_prefix(root_name.as_std_path()).ok(),
+                                        Some(path.as_path()),
+                                    ]
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(move |path| {
+                                        path_style.join_path_preserving_components(root, path).ok()
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        };
+                        for path in paths {
+                            let Some(path_string) = path.to_str() else {
+                                failures.push(format!("{path:?}: path is not valid UTF-8"));
+                                continue;
+                            };
+                            let Ok(task) = project.update(cx, |project, cx| {
+                                project.resolve_abs_file_link(path_string, cx)
+                            }) else {
+                                return Ok(());
+                            };
+                            let resolved_path = match task.await {
+                                Ok(Some(path)) => path,
+                                Ok(None) => {
+                                    failures.push(format!("{path:?}: no matching file"));
+                                    continue;
+                                }
+                                Err(error) => {
+                                    failures.push(format!("{path:?}: {error:#}"));
+                                    continue;
+                                }
+                            };
+                            target = Some((resolved_path, point));
+                            break 'resolve;
+                        }
+                    }
+                    let Some((target, point)) = target else {
+                        let details = if failures.is_empty() {
+                            "no candidate file paths".to_string()
+                        } else {
+                            failures.join("; ")
+                        };
+                        log::warn!(
+                            "Could not resolve agent file link {url:?} against project roots {roots:?}: {details}"
+                        );
+                        return anyhow::Ok(());
+                    };
+                    let Some(task) = workspace
+                        .update_in(cx, |workspace, window, cx| {
+                            workspace.open_resolved_path(target, window, cx)
+                        })
+                        .ok()
+                    else {
+                        return Ok(());
+                    };
+                    let item = task.await?;
+                    if let Some(point) = point
+                        && let Some(editor) = item.downcast::<Editor>()
+                    {
+                        editor
+                            .update_in(cx, |editor, window, cx| {
+                                if let Some(buffer) = editor.buffer().read(cx).as_singleton() {
+                                    let point = buffer
+                                        .read(cx)
+                                        .snapshot()
+                                        .point_from_external_input(point.row, point.column);
+                                    editor.go_to_singleton_buffer_point(point, window, cx);
+                                }
+                            })
+                            .ok();
+                    }
+                    Ok(())
+                })
+                .detach_and_log_err(cx);
+            return;
+        }
+    }
+
+    if let Some(mention) = MentionUri::parse_hyperlink(&url, path_style).log_err() {
+        // Percent escapes in bare paths are ambiguous: prefer the decoded
+        // interpretation, falling back to the literal one (e.g. a file
+        // actually named `a%20b.rs`) only when the decoded path doesn't
+        // resolve in the project but the literal one does.
+        let resolves_in_project = |mention: &MentionUri, cx: &App| {
+            mention.abs_path().is_some_and(|abs_path| {
+                let project = workspace.read(cx).project().read(cx);
+                project
+                    .find_project_path(abs_path, cx)
+                    .is_some_and(|path| project.entry_for_path(&path, cx).is_some())
+            })
+        };
+        let mention = match MentionUri::parse_hyperlink_literal(&url, path_style) {
+            Some(literal)
+                if !resolves_in_project(&mention, cx) && resolves_in_project(&literal, cx) =>
+            {
+                literal
+            }
+            _ => mention,
+        };
         workspace.update(cx, |workspace, cx| match mention {
             MentionUri::File { abs_path } => {
-                let project = workspace.project();
-                let Some(path) =
-                    project.update(cx, |project, cx| project.find_project_path(abs_path, cx))
-                else {
-                    return;
-                };
-
-                workspace
-                    .open_path(path, None, true, window, cx)
-                    .detach_and_log_err(cx);
+                open_abs_path_at_point(workspace, abs_path, None, window, cx);
             }
-            MentionUri::PastedImage => {}
+            MentionUri::PastedImage { .. } => {}
             MentionUri::Directory { abs_path } => {
                 let project = workspace.project();
                 let Some(entry_id) = project.update(cx, |project, cx| {
@@ -8390,39 +13558,27 @@ pub(crate) fn open_link(
                 abs_path: path,
                 line_range,
                 ..
+            } => {
+                open_abs_path_at_point(
+                    workspace,
+                    path,
+                    Some(Point::new(*line_range.start(), 0)),
+                    window,
+                    cx,
+                );
             }
-            | MentionUri::Selection {
+            MentionUri::Selection {
                 abs_path: Some(path),
                 line_range,
+                column,
             } => {
-                let project = workspace.project();
-                let Some(path) =
-                    project.update(cx, |project, cx| project.find_project_path(path, cx))
-                else {
-                    return;
-                };
-
-                let item = workspace.open_path(path, None, true, window, cx);
-                window
-                    .spawn(cx, async move |cx| {
-                        let Some(editor) = item.await?.downcast::<Editor>() else {
-                            return Ok(());
-                        };
-                        let range =
-                            Point::new(*line_range.start(), 0)..Point::new(*line_range.start(), 0);
-                        editor
-                            .update_in(cx, |editor, window, cx| {
-                                editor.change_selections(
-                                    SelectionEffects::scroll(Autoscroll::center()),
-                                    window,
-                                    cx,
-                                    |s| s.select_ranges(vec![range]),
-                                );
-                            })
-                            .ok();
-                        anyhow::Ok(())
-                    })
-                    .detach_and_log_err(cx);
+                open_abs_path_at_point(
+                    workspace,
+                    path,
+                    Some(Point::new(*line_range.start(), column.unwrap_or(0))),
+                    window,
+                    cx,
+                );
             }
             MentionUri::Selection { abs_path: None, .. } => {}
             MentionUri::Thread { id, name } => {
@@ -8432,26 +13588,6 @@ pub(crate) fn open_link(
                     });
                 }
             }
-            MentionUri::TextThread { path, .. } => {
-                if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
-                    panel.update(cx, |panel, cx| {
-                        panel
-                            .open_saved_text_thread(path.as_path().into(), window, cx)
-                            .detach_and_log_err(cx);
-                    });
-                }
-            }
-            MentionUri::Rule { id, .. } => {
-                let PromptId::User { uuid } = id else {
-                    return;
-                };
-                window.dispatch_action(
-                    Box::new(OpenRulesLibrary {
-                        prompt_to_select: Some(uuid.0),
-                    }),
-                    cx,
-                )
-            }
             MentionUri::Fetch { url } => {
                 cx.open_url(url.as_str());
             }
@@ -8459,8 +13595,1263 @@ pub(crate) fn open_link(
             MentionUri::TerminalSelection { .. } => {}
             MentionUri::GitDiff { .. } => {}
             MentionUri::MergeConflict { .. } => {}
+            MentionUri::Rule { name, .. } => {
+                crate::ui::open_migrated_rule(workspace, &name, window, cx);
+            }
+            MentionUri::Skill {
+                skill_file_path, ..
+            } => {
+                workspace
+                    .open_abs_path(
+                        skill_file_path,
+                        workspace::OpenOptions {
+                            focus: Some(true),
+                            ..Default::default()
+                        },
+                        window,
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
+            }
         })
     } else {
-        cx.open_url(&url);
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_url_or_file(&url, None, window, cx);
+        });
     }
+}
+
+fn file_link_parts(input: &str, path_style: PathStyle) -> Option<(&str, Option<&str>)> {
+    let (path, fragment) = input
+        .split_once('#')
+        .map_or((input, None), |(path, fragment)| (path, Some(fragment)));
+    if !path_style.is_absolute(path)
+        && let Ok(url) = Url::parse(input)
+        && (!url.scheme().contains('.')
+            || url.path().trim_matches(':').is_empty()
+            || !PathWithPosition::parse_str(path)
+                .path
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(url.scheme())))
+    {
+        return None;
+    }
+    Some((path, fragment))
+}
+
+fn file_link_candidates(
+    path: &str,
+    fragment_point: Option<Point>,
+    path_style: PathStyle,
+) -> Vec<(PathBuf, Option<Point>)> {
+    if path_style.is_windows() && path_style.is_absolute(path) {
+        return [
+            MentionUri::parse_hyperlink(path, path_style).ok(),
+            MentionUri::parse_hyperlink_literal(path, path_style),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|mention| match mention {
+            MentionUri::File { abs_path } => Some((abs_path, fragment_point)),
+            MentionUri::Selection {
+                abs_path: Some(abs_path),
+                line_range,
+                column,
+            } => Some((
+                abs_path,
+                Some(
+                    fragment_point.unwrap_or(Point::new(*line_range.start(), column.unwrap_or(0))),
+                ),
+            )),
+            _ => None,
+        })
+        .collect();
+    }
+    let decoded_path = decode_path_escapes(path);
+    let mut candidates = Vec::new();
+    for path in std::iter::once(decoded_path.as_ref()).chain((decoded_path != path).then_some(path))
+    {
+        let path = if path_style.is_windows() {
+            PathBuf::from(path.replace('\\', "/"))
+        } else {
+            PathBuf::from(path)
+        };
+        candidates.push((path.clone(), fragment_point));
+        let position = PathWithPosition::parse_str(&path.to_string_lossy());
+        if let Some(row) = position.row.and_then(|row| row.checked_sub(1)) {
+            candidates.push((
+                position.path,
+                Some(fragment_point.unwrap_or(Point::new(
+                    row,
+                    position.column.unwrap_or(1).saturating_sub(1),
+                ))),
+            ));
+        }
+    }
+    candidates
+}
+
+/// Returns the name of the leading built-in (native-category) slash command —
+/// e.g. `compact` for `/compact` or `/compact summarize the API work` — whether
+/// or not the user typed any trailing text after it. Built-in commands ignore
+/// trailing arguments, so the caller sends the bare command and queues any
+/// remainder rather than discarding it. Commands from MCP servers and ACP
+/// agents are excluded: their trailing text is a real argument the agent
+/// consumes.
+///
+/// Native commands run a turn that produces its own thread entry, so the typed
+/// command is never echoed as a user message (see `send_command_queueing_remainder`).
+fn leading_native_command(
+    text: &str,
+    available_commands: &[acp_v2::AvailableCommand],
+) -> Option<String> {
+    let rest = text.trim_start().strip_prefix('/')?;
+    let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..name_end];
+    let is_native = available_commands.iter().any(|command| {
+        command.name == name
+            && acp_thread::command_category_from_meta(&command.meta)
+                == Some(acp_thread::CommandCategory::Native)
+    });
+    is_native.then(|| name.to_string())
+}
+
+/// Removes a leading `/command_name` token from `text`, returning the trimmed
+/// remainder. Falls back to the trimmed input if the prefix isn't present.
+fn strip_leading_command(text: &str, command_name: &str) -> String {
+    let trimmed = text.trim_start();
+    trimmed
+        .strip_prefix('/')
+        .and_then(|rest| rest.strip_prefix(command_name))
+        .map(|rest| rest.trim_start().to_string())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::UpdateGlobal;
+    use project::{FakeFs, Project};
+    use serde_json::json;
+    use settings::{SettingsStore, SplicingVec};
+    use std::sync::Once;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    #[test]
+    fn test_reported_activity_completion_status() {
+        use acp_v2::StopReason::*;
+        for (reason, expected) in [
+            (None, "unknown"),
+            (
+                Some(Other(acp_v2::OtherStopReason::new(
+                    "_custom",
+                    Default::default(),
+                ))),
+                "unknown",
+            ),
+            (Some(EndTurn), "success"),
+            (Some(Cancelled), "cancelled"),
+            (Some(Refusal), "failure"),
+            (Some(MaxTokens), "failure"),
+            (Some(MaxTurnRequests), "failure"),
+            (Some(Error(acp_v2::ErrorStopReason::new())), "failure"),
+        ] {
+            assert_eq!(
+                ThreadView::activity_completion_status(reason.as_ref()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_call_icon_tooltip() {
+        for (name, interrupted_edit, expected) in [
+            (None, false, None),
+            (Some(" \t\n"), false, None),
+            (Some("read_file"), false, Some("Tool: read_file")),
+            (
+                Some("  mcp__server__**read_file**<raw>  "),
+                false,
+                Some("Tool:   mcp__server__**read_file**<raw>  "),
+            ),
+            (None, true, Some("Interrupted Edit")),
+            (Some(" \t\n"), true, Some("Interrupted Edit")),
+            (
+                Some("edit_file"),
+                true,
+                Some("Interrupted Edit\nTool: edit_file"),
+            ),
+        ] {
+            let name = name.map(SharedString::from);
+            assert_eq!(
+                ThreadView::tool_call_icon_tooltip(name.as_ref(), interrupted_edit).as_deref(),
+                expected,
+            );
+        }
+    }
+
+    fn native_command(name: &str) -> acp_v2::AvailableCommand {
+        acp_v2::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
+            acp_thread::CommandCategory::Native,
+        ))
+    }
+
+    fn mcp_command(name: &str) -> acp_v2::AvailableCommand {
+        acp_v2::AvailableCommand::new(name, "").meta(acp_thread::meta_with_command_category(
+            acp_thread::CommandCategory::Mcp,
+        ))
+    }
+
+    #[test]
+    fn test_leading_native_command_matches_bare_and_with_remainder() {
+        let commands = [native_command("compact"), mcp_command("deploy")];
+
+        // Native command with trailing text.
+        assert_eq!(
+            leading_native_command("/compact summarize the API work", &commands),
+            Some("compact".to_string())
+        );
+        // Leading/trailing whitespace is tolerated.
+        assert_eq!(
+            leading_native_command("  /compact   do x  ", &commands),
+            Some("compact".to_string())
+        );
+
+        // Bare native command (no remainder) is still recognized, so it runs as
+        // a command turn (without echoing a user message) rather than being sent
+        // to the model as a normal prompt.
+        assert_eq!(
+            leading_native_command("/compact", &commands),
+            Some("compact".to_string())
+        );
+        assert_eq!(
+            leading_native_command("/compact   ", &commands),
+            Some("compact".to_string())
+        );
+
+        // MCP/ACP commands are not native: their trailing text is a real
+        // argument the agent consumes, and they echo as normal user messages.
+        assert_eq!(leading_native_command("/deploy prod", &commands), None);
+        assert_eq!(leading_native_command("/deploy", &commands), None);
+
+        // Unknown command, or not a slash command at all.
+        assert_eq!(leading_native_command("/unknown foo", &commands), None);
+        assert_eq!(leading_native_command("just a message", &commands), None);
+    }
+
+    #[test]
+    fn test_strip_leading_command() {
+        assert_eq!(strip_leading_command("/compact do x", "compact"), "do x");
+        assert_eq!(
+            strip_leading_command("  /compact  do x ", "compact"),
+            "do x "
+        );
+        // No matching prefix: returns the trimmed input unchanged.
+        assert_eq!(strip_leading_command("hello", "compact"), "hello");
+    }
+
+    #[test]
+    fn test_file_link_parts() {
+        for (input, expected) in [
+            ("src/main.rs:2", Some(("src/main.rs:2", None))),
+            ("./tel:123", Some(("./tel:123", None))),
+            ("main.rs:2#L3", Some(("main.rs:2", Some("L3")))),
+            ("main.rs:2:4#3C2", Some(("main.rs:2:4", Some("3C2")))),
+            ("main.rs:0", Some(("main.rs:0", None))),
+            ("main.rs:4294967295", Some(("main.rs:4294967295", None))),
+            ("main.rs:4294967296", Some(("main.rs:4294967296", None))),
+            ("main.rs:2:4294967296", Some(("main.rs:2:4294967296", None))),
+            ("custom.proto:123", Some(("custom.proto:123", None))),
+            ("main.rs:2:3:4", None),
+            ("main.rs:2:", Some(("main.rs:2:", None))),
+            ("MAIN.RS:2:", Some(("MAIN.RS:2:", None))),
+            ("main.rs:-2", None),
+            ("tel:123", None),
+            ("custom:123", None),
+            ("com.example.viewer:", None),
+            ("com.example.viewer::", None),
+            ("file:/project/a:2", None),
+            ("file:///project/a%3A2", None),
+            ("https://example.com/main.rs:2#L3", None),
+        ] {
+            assert_eq!(file_link_parts(input, PathStyle::Unix), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn test_file_link_candidates_windows() {
+        for (path, expected_path, expected_point) in [
+            (
+                r"C:\project\main.rs#L2",
+                r"C:\project\main.rs",
+                Point::new(1, 0),
+            ),
+            (
+                "/C:/project/main.rs#42",
+                r"C:\project\main.rs",
+                Point::new(41, 0),
+            ),
+            (
+                "/c/project/main.rs:2#L3C4",
+                r"C:\project\main.rs",
+                Point::new(2, 3),
+            ),
+            (
+                "//server/share/main.rs#42:3",
+                r"\\server\share\main.rs",
+                Point::new(41, 2),
+            ),
+            (
+                "/C:/project/main.rs:2:4",
+                r"C:\project\main.rs",
+                Point::new(1, 3),
+            ),
+            (
+                "/c/project/main.rs:2",
+                r"C:\project\main.rs",
+                Point::new(1, 0),
+            ),
+            (
+                r"C:\project\a%20b.rs:2",
+                r"C:\project\a b.rs",
+                Point::new(1, 0),
+            ),
+        ] {
+            let (path, fragment) = file_link_parts(path, PathStyle::Windows).unwrap();
+            let fragment_point = fragment
+                .and_then(source_position_from_fragment)
+                .map(|(row, column)| Point::new(row, column));
+            let candidates = file_link_candidates(path, fragment_point, PathStyle::Windows);
+            assert_eq!(
+                candidates.first(),
+                Some(&(PathBuf::from(expected_path), Some(expected_point))),
+                "{path}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_open_link_bare_path(cx: &mut gpui::TestAppContext) {
+        crate::test_support::init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({"src": {"main.rs": "first\nsecond\nthird\n"}}),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let workspace_weak = workspace.downgrade();
+
+        // Relative path — call from multi_workspace so the inner workspace entity is not locked
+        multi_workspace.update_in(cx, |_, window, cx| {
+            open_link("src/main.rs".into(), &workspace_weak, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let active = workspace
+                .active_item(cx)
+                .and_then(|item| item.project_path(cx))
+                .expect("file should be open");
+            assert!(*active.path == *"src/main.rs");
+        });
+
+        multi_workspace.update_in(cx, |_, window, cx| {
+            open_link("src/main.rs#L2".into(), &workspace_weak, window, cx);
+        });
+        cx.run_until_parked();
+        let editor = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<Editor>())
+                .expect("file should be open in an editor")
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            assert_eq!(editor.selections.newest::<Point>(&snapshot).head().row, 1);
+        });
+
+        // Absolute path
+        let abs_path: SharedString = path!("/project/src/main.rs").to_string().into();
+        multi_workspace.update_in(cx, |_, window, cx| {
+            open_link(abs_path, &workspace_weak, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let active = workspace
+                .active_item(cx)
+                .and_then(|item| item.project_path(cx))
+                .expect("file should be open");
+            assert!(*active.path == *"src/main.rs");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_link_relative_positions(cx: &mut gpui::TestAppContext) {
+        crate::test_support::init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.worktree.file_scan_exclusions =
+                        Some(SplicingVec::from(vec!["**/excluded.rs".to_string()]));
+                });
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                "src": {"main.rs": "first\naéøbc\nthird\n", "a": "first\nsecond\n", "excluded.rs": "first\nsecond\n"},
+                "main.rs": "first\naéøbc\nthird\n",
+                "project": {"src": {"main.rs": "wrong file"}},
+                "x.rs": {"x.rs": "first\nsecond\n"},
+                "a b.rs": "first\nsecond\n",
+                "a%20b.rs": "wrong file",
+                "literal%20space.rs": "first\nsecond\n",
+                "a%2Fb.rs": "first\nsecond\n",
+            }),
+        )
+        .await;
+        fs.insert_tree(path!("/other"), json!({"main.rs": "one\ntwo\n"}))
+            .await;
+        #[cfg(not(target_os = "windows"))]
+        fs.insert_tree(
+            path!("/project"),
+            json!({"literal.rs": "wrong file", "literal.rs:2": "literal file"}),
+        )
+        .await;
+
+        let project = Project::test(
+            fs,
+            [path!("/project").as_ref(), path!("/other").as_ref()],
+            cx,
+        )
+        .await;
+        let worktree_ids = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .map(|worktree| worktree.read(cx).id())
+                .collect::<Vec<_>>()
+        });
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+        let workspace_weak = workspace.downgrade();
+
+        for (url, expected_path, expected_point) in [
+            (
+                "project/src/excluded.rs:2",
+                path!("/project/src/excluded.rs"),
+                Point::new(1, 0),
+            ),
+            (
+                "src/excluded.rs:2",
+                path!("/project/src/excluded.rs"),
+                Point::new(1, 0),
+            ),
+            (
+                path!("/project/main.rs#2"),
+                path!("/project/main.rs"),
+                Point::new(1, 0),
+            ),
+            (
+                path!("/project/main.rs#L3"),
+                path!("/project/main.rs"),
+                Point::new(2, 0),
+            ),
+            (
+                path!("/project/main.rs#2C4"),
+                path!("/project/main.rs"),
+                Point::new(1, 5),
+            ),
+            ("main.rs:2#L3", path!("/project/main.rs"), Point::new(2, 0)),
+            (
+                "main.rs:3#L2:4",
+                path!("/project/main.rs"),
+                Point::new(1, 5),
+            ),
+            ("./src/a:2", path!("/project/src/a"), Point::new(1, 0)),
+            ("src/a:2:4", path!("/project/src/a"), Point::new(1, 3)),
+            (
+                "src/main.rs:2",
+                path!("/project/src/main.rs"),
+                Point::new(1, 0),
+            ),
+            (
+                "src/main.rs:2:4",
+                path!("/project/src/main.rs"),
+                Point::new(1, 5),
+            ),
+            (
+                "project/src/main.rs:3",
+                path!("/project/src/main.rs"),
+                Point::new(2, 0),
+            ),
+            (
+                "./src/main.rs:1:2",
+                path!("/project/src/main.rs"),
+                Point::new(0, 1),
+            ),
+            ("main.rs:2", path!("/project/main.rs"), Point::new(1, 0)),
+            ("main.rs:2:", path!("/project/main.rs"), Point::new(1, 0)),
+            ("main.rs(2,4)", path!("/project/main.rs"), Point::new(1, 5)),
+            ("other/main.rs:2", path!("/other/main.rs"), Point::new(1, 0)),
+            ("x.rs/x.rs:2", path!("/project/x.rs/x.rs"), Point::new(1, 0)),
+            ("a%20b.rs:2", path!("/project/a b.rs"), Point::new(1, 0)),
+            (
+                "literal%20space.rs:2",
+                path!("/project/literal%20space.rs"),
+                Point::new(1, 0),
+            ),
+            ("a%2Fb.rs:2", path!("/project/a%2Fb.rs"), Point::new(1, 0)),
+            (
+                "src/main.rs#L2",
+                path!("/project/src/main.rs"),
+                Point::new(1, 0),
+            ),
+            (
+                "src/main.rs:2:0",
+                path!("/project/src/main.rs"),
+                Point::new(1, 0),
+            ),
+            (
+                "src/main.rs:4294967295",
+                path!("/project/src/main.rs"),
+                Point::new(3, 0),
+            ),
+            #[cfg(not(target_os = "windows"))]
+            (
+                "file:/project/literal.rs:2",
+                path!("/project/literal.rs:2"),
+                Point::new(0, 0),
+            ),
+            #[cfg(not(target_os = "windows"))]
+            (
+                "literal.rs:2",
+                path!("/project/literal.rs:2"),
+                Point::new(0, 0),
+            ),
+        ] {
+            multi_workspace.update_in(cx, |_, window, cx| {
+                open_link(SharedString::from(url), &workspace_weak, window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(cx.opened_url(), None, "{url}");
+            let editor = workspace.read_with(cx, |workspace, cx| {
+                let item = workspace.active_item(cx).expect("file should be open");
+                let project_path = item
+                    .project_path(cx)
+                    .expect("item should have a project path");
+                assert_eq!(
+                    project.read(cx).absolute_path(&project_path, cx).as_deref(),
+                    Some(Path::new(expected_path)),
+                    "{url}"
+                );
+                item.downcast::<Editor>()
+                    .expect("file should be open in an editor")
+            });
+            editor.update_in(cx, |editor, window, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                assert_eq!(
+                    editor.selections.newest::<Point>(&snapshot).head(),
+                    expected_point,
+                    "{url}"
+                );
+            });
+            project.read_with(cx, |project, cx| {
+                assert_eq!(
+                    project
+                        .worktrees(cx)
+                        .map(|worktree| worktree.read(cx).id())
+                        .collect::<Vec<_>>(),
+                    worktree_ids,
+                    "{url}"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_open_link_external_urls(cx: &mut gpui::TestAppContext) {
+        crate::test_support::init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({"src": {"main.rs": ""}, "tel": "not a phone", "custom": "not a URI handler"}),
+        )
+        .await;
+        #[cfg(not(target_os = "windows"))]
+        fs.insert_tree(
+            path!("/project"),
+            json!({"mailto:contact@example.com": "not the email handler"}),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+
+        for url in [
+            "https://example.com/src/main.rs:2",
+            "mailto:contact@example.com",
+            "tel:123",
+            "custom:123",
+            "com.example.viewer:",
+            "com.example.viewer::",
+        ] {
+            multi_workspace.update_in(cx, |_, window, cx| {
+                open_link(SharedString::from(url), &workspace.downgrade(), window, cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(cx.opened_url().as_deref(), Some(url));
+            workspace.read_with(cx, |workspace, cx| {
+                assert!(workspace.active_item(cx).is_none());
+            });
+        }
+        project.read_with(cx, |project, cx| {
+            assert_eq!(project.worktrees(cx).count(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_link_percent_escape_disambiguation(cx: &mut gpui::TestAppContext) {
+        crate::test_support::init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                "a%20b.rs": "literal\nsecond\n",
+                "a b.rs": "decoded\nsecond\n",
+                "c d.rs": "first\nsecond\n",
+                "e%20f.rs": "first\nsecond\n",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let workspace_weak = workspace.downgrade();
+
+        let open_link_and_active_path = |url: String, cx: &mut gpui::VisualTestContext| {
+            multi_workspace.update_in(cx, |_, window, cx| {
+                open_link(url.into(), &workspace_weak, window, cx);
+            });
+            cx.run_until_parked();
+            workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .active_item(cx)
+                    .and_then(|item| item.project_path(cx))
+                    .expect("file should be open")
+                    .path
+            })
+        };
+
+        // Both interpretations exist: the decoded one wins.
+        let path = open_link_and_active_path(path!("/project/a%20b.rs").to_string(), cx);
+        assert_eq!(*path, *"a b.rs");
+
+        // Only the decoded file exists.
+        let path = open_link_and_active_path(path!("/project/c%20d.rs").to_string(), cx);
+        assert_eq!(*path, *"c d.rs");
+
+        // Only the literally-named file exists: fall back to it.
+        let path = open_link_and_active_path(path!("/project/e%20f.rs").to_string(), cx);
+        assert_eq!(*path, *"e%20f.rs");
+
+        let path = open_link_and_active_path("a%20b.rs#L2".to_string(), cx);
+        assert_eq!(*path, *"a b.rs");
+
+        let path = open_link_and_active_path("c%20d.rs#L2".to_string(), cx);
+        assert_eq!(*path, *"c d.rs");
+
+        let path = open_link_and_active_path("e%20f.rs#L2".to_string(), cx);
+        assert_eq!(*path, *"e%20f.rs");
+        let editor = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<Editor>())
+                .expect("file should be open in an editor")
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            assert_eq!(editor.selections.newest::<Point>(&snapshot).head().row, 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_file_link_parent_traversal_uses_selected_worktree(cx: &mut gpui::TestAppContext) {
+        crate::test_support::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/one"), json!({"two": {"src": "not a directory"}}))
+            .await;
+        fs.insert_tree(
+            path!("/two"),
+            json!({"src": {}, "file.rs": "selected file"}),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/one").as_ref(), path!("/two").as_ref()], cx).await;
+        let unindexed_buffer = project
+            .update(cx, |project, cx| {
+                let path = project
+                    .project_path_for_absolute_path(Path::new(path!("/one/file.rs")), cx)
+                    .unwrap();
+                project.open_buffer(path, cx)
+            })
+            .await
+            .unwrap();
+        project.read_with(cx, |project, cx| {
+            let unindexed_path = project
+                .project_path_for_absolute_path(Path::new(path!("/one/file.rs")), cx)
+                .unwrap();
+            assert!(project.entry_for_path(&unindexed_path, cx).is_none());
+            assert_eq!(
+                project.get_open_buffer(&unindexed_path, cx).unwrap(),
+                unindexed_buffer,
+            );
+            let expected = project
+                .project_path_for_absolute_path(Path::new(path!("/two/file.rs")), cx)
+                .unwrap();
+            for path in [
+                "src/../file.rs",
+                "two/src/../file.rs",
+                "two/file.rs",
+                path!("/two/src/../file.rs"),
+            ] {
+                assert_eq!(
+                    project_path_for_file_link(project, Path::new(path), cx),
+                    Some(expected.clone()),
+                    "{path}",
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn test_open_link_preserves_project_symlink_buffer(cx: &mut gpui::TestAppContext) {
+        crate::test_support::init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({"sub": {}, "main.rs": "other file"}),
+        )
+        .await;
+        fs.insert_tree(path!("/outside"), json!({"target.rs": "original\n"}))
+            .await;
+        fs.insert_symlink(
+            path!("/project/link.rs"),
+            PathBuf::from(path!("/outside/target.rs")),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+        let workspace_weak = workspace.downgrade();
+        multi_workspace.update_in(cx, |_, window, cx| {
+            open_link(SharedString::from("link.rs"), &workspace_weak, window, cx);
+        });
+        cx.run_until_parked();
+        let original = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .unwrap()
+                .downcast::<Editor>()
+                .unwrap()
+        });
+        original.update_in(cx, |editor, window, cx| {
+            editor.insert("unsaved ", window, cx)
+        });
+
+        for excluded in [false, true] {
+            if excluded {
+                cx.update(|_, cx| {
+                    SettingsStore::update_global(cx, |store, cx| {
+                        store.update_user_settings(cx, |settings| {
+                            settings.project.worktree.file_scan_exclusions =
+                                Some(SplicingVec::from(vec![
+                                    "**/link.rs".to_string(),
+                                    "**/sub".to_string(),
+                                ]));
+                        });
+                    });
+                });
+                cx.run_until_parked();
+                project.read_with(cx, |project, cx| {
+                    let path = project
+                        .project_path_for_absolute_path(Path::new(path!("/project/link.rs")), cx)
+                        .unwrap();
+                    assert!(project.entry_for_path(&path, cx).is_none());
+                    assert!(project.get_open_buffer(&path, cx).is_some());
+                });
+            }
+            for (url, use_absolute_helper) in [
+                ("link.rs", false),
+                ("project/link.rs", false),
+                (path!("/project/link.rs"), false),
+                (path!("/project//link.rs"), false),
+                (path!("/project//link.rs"), true),
+                (path!("/project/sub/../link.rs"), false),
+                ("project/sub/../link.rs#L1", false),
+                (path!("/project/sub/../link.rs"), true),
+            ] {
+                multi_workspace.update_in(cx, |_, window, cx| {
+                    open_link(SharedString::from("main.rs"), &workspace_weak, window, cx);
+                });
+                cx.run_until_parked();
+                multi_workspace.update_in(cx, |_, window, cx| {
+                    if use_absolute_helper {
+                        workspace.update(cx, |workspace, cx| {
+                            open_abs_path_at_point(workspace, PathBuf::from(url), None, window, cx);
+                        });
+                    } else {
+                        open_link(SharedString::from(url), &workspace_weak, window, cx);
+                    }
+                });
+                cx.run_until_parked();
+                workspace.read_with(cx, |workspace, cx| {
+                    let active = workspace
+                        .active_item(cx)
+                        .unwrap()
+                        .downcast::<Editor>()
+                        .unwrap();
+                    assert_eq!(active.entity_id(), original.entity_id(), "{url}");
+                    assert_eq!(active.read(cx).text(cx), "unsaved original\n");
+                    assert_eq!(project.read(cx).worktrees(cx).count(), 1);
+                });
+                assert_eq!(cx.opened_url(), None);
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn test_open_link_does_not_retain_closed_project(cx: &mut gpui::TestAppContext) {
+        crate::test_support::init_test(cx);
+
+        let mut previous_workspace = None;
+        for url in [
+            format!("{}:2", path!("/outside/notes.md")),
+            format!(
+                "{}#L2",
+                Url::from_file_path(path!("/outside/notes.md")).unwrap()
+            ),
+        ] {
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/project"), json!({"main.rs": ""}))
+                .await;
+            fs.insert_tree(path!("/outside"), json!({"notes.md": "first\nsecond\n"}))
+                .await;
+            let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+            let project_weak = project.downgrade();
+            let (multi_workspace, window_cx) = cx.add_window_view(|window, cx| {
+                MultiWorkspace::test_new(project.clone(), window, cx)
+            });
+            let multi_workspace_weak = multi_workspace.downgrade();
+            let workspace =
+                multi_workspace.read_with(window_cx, |workspace, _| workspace.workspace().clone());
+            let workspace_weak = workspace.downgrade();
+            if let Some(previous_workspace) = previous_workspace.take() {
+                window_cx.update(|window, cx| {
+                    open_link(
+                        SharedString::from("missing.rs:2"),
+                        &previous_workspace,
+                        window,
+                        cx,
+                    );
+                });
+                assert_eq!(window_cx.opened_url(), None);
+            }
+            drop(project);
+            drop(workspace);
+            drop(multi_workspace);
+
+            window_cx.update(|window, cx| {
+                open_link(SharedString::from(url.clone()), &workspace_weak, window, cx);
+                window.remove_window();
+            });
+            assert!(multi_workspace_weak.upgrade().is_none(), "{url}");
+            assert!(workspace_weak.upgrade().is_none(), "{url}");
+            assert!(project_weak.upgrade().is_none(), "{url}");
+            window_cx.run_until_parked();
+            assert_eq!(window_cx.opened_url(), None, "{url}");
+            previous_workspace = Some(workspace_weak);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_open_link_out_of_project_path(cx: &mut gpui::TestAppContext) {
+        crate::test_support::init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({"src": {"main.rs": ""}}))
+            .await;
+        fs.insert_tree(
+            path!("/outside"),
+            json!({
+                "notes.md": "first\naéøbc\nthird\n",
+                "a b.rs": "first\nsecond\n",
+                "a%20b.rs": "literal file",
+                "literal%20space.rs": "first\nsecond\n",
+                "x.rs": {"x.rs": "first\nsecond\n"},
+            }),
+        )
+        .await;
+
+        fs.insert_symlink(
+            path!("/outside/notes-link.md"),
+            PathBuf::from(path!("/outside/notes.md")),
+        )
+        .await;
+        #[cfg(not(target_os = "windows"))]
+        fs.insert_tree(
+            path!("/outside"),
+            json!({"literal.rs": "base file", "literal.rs:2": "literal file"}),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let visible_worktree_ids = project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .map(|worktree| worktree.read(cx).id())
+                .collect::<Vec<_>>()
+        });
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+        let workspace_weak = workspace.downgrade();
+
+        let missing_file_uri = Url::from_file_path(path!("/outside/missing.md"))
+            .unwrap()
+            .to_string();
+        for (url, attempted_paths) in [
+            (
+                "main.rs:2".to_string(),
+                vec![
+                    PathBuf::from(path!("/project/main.rs:2")),
+                    PathBuf::from(path!("/project/main.rs")),
+                ],
+            ),
+            (
+                "main.rs:2#L3".to_string(),
+                vec![
+                    PathBuf::from(path!("/project/main.rs:2")),
+                    PathBuf::from(path!("/project/main.rs")),
+                ],
+            ),
+            (
+                "crates/editor/src/inlays/inlay_hints.rs:394".to_string(),
+                vec![
+                    Path::new(path!("/project"))
+                        .join("crates/editor/src/inlays/inlay_hints.rs:394"),
+                    Path::new(path!("/project"))
+                        .join("crates/editor/src/inlays")
+                        .join("inlay_hints.rs"),
+                ],
+            ),
+            (
+                "crates/editor/src/element.rs:608".to_string(),
+                vec![
+                    Path::new(path!("/project")).join("crates/editor/src/element.rs:608"),
+                    Path::new(path!("/project"))
+                        .join("crates/editor/src")
+                        .join("element.rs"),
+                ],
+            ),
+            (missing_file_uri.clone(), Vec::new()),
+            (
+                "../outside/missing.md:2".to_string(),
+                vec![
+                    Path::new(path!("/project")).join("../outside/missing.md:2"),
+                    Path::new(path!("/project"))
+                        .join("../outside")
+                        .join("missing.md"),
+                ],
+            ),
+            (
+                path!("/outside/missing.md").to_string(),
+                vec![PathBuf::from(path!("/outside/missing.md"))],
+            ),
+            (
+                path!("/project/src/missing.md").to_string(),
+                vec![PathBuf::from(path!("/project/src/missing.md"))],
+            ),
+            (
+                path!("/outside").to_string(),
+                vec![PathBuf::from(path!("/outside"))],
+            ),
+        ] {
+            let warnings = FileLinkWarningCapture::new();
+            multi_workspace.update_in(cx, |_, window, cx| {
+                open_link(SharedString::from(url.clone()), &workspace_weak, window, cx);
+            });
+            cx.run_until_parked();
+            let expected_warning = if url == missing_file_uri {
+                format!(
+                    "Could not resolve agent file link to {:?}: no matching file",
+                    Path::new(path!("/outside/missing.md"))
+                )
+            } else {
+                let failures = attempted_paths
+                    .into_iter()
+                    .map(|path| format!("{path:?}: no matching file"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!(
+                    "Could not resolve agent file link {url:?} against project roots {:?}: {failures}",
+                    [Path::new(path!("/project"))]
+                )
+            };
+            assert_eq!(warnings.take(), [expected_warning], "{url}");
+            workspace.read_with(cx, |workspace, cx| {
+                assert!(workspace.active_item(cx).is_none());
+                assert_eq!(workspace.notification_ids().len(), 0);
+                assert_eq!(project.read(cx).worktrees(cx).count(), 1);
+            });
+            assert_eq!(cx.opened_url(), None);
+            assert!(cx.pending_prompt().is_none());
+        }
+
+        let file_uri = url::Url::from_file_path(path!("/outside/notes.md")).unwrap();
+        let literal_uri = Url::from_file_path(path!("/outside/a%20b.rs")).unwrap();
+        let symlink_uri = Url::from_file_path(path!("/outside/notes-link.md")).unwrap();
+        let mut opened_worktrees = HashMap::default();
+        for (url, expected_path, expected_point) in [
+            (
+                literal_uri.to_string(),
+                path!("/outside/a%20b.rs"),
+                Point::new(0, 0),
+            ),
+            (
+                format!("{}:2", path!("/outside/a%20b.rs")),
+                path!("/outside/a b.rs"),
+                Point::new(1, 0),
+            ),
+            #[cfg(not(target_os = "windows"))]
+            (
+                path!("/outside/literal.rs").to_string(),
+                path!("/outside/literal.rs"),
+                Point::new(0, 0),
+            ),
+            #[cfg(not(target_os = "windows"))]
+            (
+                "../outside/literal.rs:2".to_string(),
+                path!("/outside/literal.rs:2"),
+                Point::new(0, 0),
+            ),
+            (
+                "../outside/notes.md:2:4".to_string(),
+                path!("/outside/notes.md"),
+                Point::new(1, 5),
+            ),
+            (
+                format!("{}:3", path!("/outside/notes.md")),
+                path!("/outside/notes.md"),
+                Point::new(2, 0),
+            ),
+            (
+                format!("{file_uri}#L2"),
+                path!("/outside/notes.md"),
+                Point::new(1, 0),
+            ),
+            (
+                "../outside/notes.md#L3".to_string(),
+                path!("/outside/notes.md"),
+                Point::new(2, 0),
+            ),
+            (
+                "../outside/a%20b.rs:2".to_string(),
+                path!("/outside/a b.rs"),
+                Point::new(1, 0),
+            ),
+            (
+                format!("{}:2", path!("/outside/literal%20space.rs")),
+                path!("/outside/literal%20space.rs"),
+                Point::new(1, 0),
+            ),
+            (
+                "../outside/x.rs/x.rs:2".to_string(),
+                path!("/outside/x.rs/x.rs"),
+                Point::new(1, 0),
+            ),
+            (
+                format!("{symlink_uri}#L2"),
+                path!("/outside/notes.md"),
+                Point::new(1, 0),
+            ),
+            (
+                "../outside/notes-link.md:3".to_string(),
+                path!("/outside/notes.md"),
+                Point::new(2, 0),
+            ),
+        ] {
+            multi_workspace.update_in(cx, |_, window, cx| {
+                open_link(SharedString::from(url.clone()), &workspace_weak, window, cx);
+            });
+            cx.run_until_parked();
+            let editor = workspace.read_with(cx, |workspace, cx| {
+                let item = workspace.active_item(cx).expect("file should be open");
+                let project_path = item.project_path(cx).expect("item should have a path");
+                let project = project.read(cx);
+                assert_eq!(
+                    project.absolute_path(&project_path, cx).as_deref(),
+                    Some(Path::new(expected_path)),
+                    "{url}"
+                );
+                assert!(project_path.path.is_empty());
+                let worktree = project
+                    .worktree_for_id(project_path.worktree_id, cx)
+                    .unwrap();
+                let worktree = worktree.read(cx);
+                assert!(!worktree.is_visible());
+                assert!(worktree.is_single_file());
+                assert_eq!(worktree.abs_path().as_ref(), Path::new(expected_path));
+                if let Some(previous_id) = opened_worktrees.insert(expected_path, worktree.id()) {
+                    assert_eq!(previous_id, worktree.id());
+                }
+                assert_eq!(project.worktrees(cx).count(), 1 + opened_worktrees.len());
+                assert_eq!(
+                    project
+                        .visible_worktrees(cx)
+                        .map(|worktree| worktree.read(cx).id())
+                        .collect::<Vec<_>>(),
+                    visible_worktree_ids
+                );
+                assert_eq!(workspace.notification_ids().len(), 0);
+                item.downcast::<Editor>().expect("should be an editor")
+            });
+            editor.update_in(cx, |editor, window, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                assert_eq!(
+                    editor.selections.newest::<Point>(&snapshot).head(),
+                    expected_point,
+                    "{url}"
+                );
+            });
+            assert_eq!(cx.opened_url(), None);
+            assert!(cx.pending_prompt().is_none());
+        }
+    }
+
+    thread_local! {
+        static FILE_LINK_WARNINGS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    struct FileLinkWarningCapture {
+        previous_level: log::LevelFilter,
+    }
+
+    impl FileLinkWarningCapture {
+        fn new() -> Self {
+            static INSTALL_LOGGER: Once = Once::new();
+            INSTALL_LOGGER.call_once(|| {
+                log::set_logger(&FileLinkTestLogger)
+                    .expect("failed to install file-link test logger");
+            });
+            let previous_level = log::max_level();
+            assert!(FILE_LINK_WARNINGS.replace(Some(Vec::new())).is_none());
+            log::set_max_level(previous_level.max(log::LevelFilter::Warn));
+            Self { previous_level }
+        }
+
+        fn take(&self) -> Vec<String> {
+            FILE_LINK_WARNINGS.with_borrow_mut(|warnings| {
+                std::mem::take(warnings.as_mut().expect("warning capture should be active"))
+            })
+        }
+    }
+
+    impl Drop for FileLinkWarningCapture {
+        fn drop(&mut self) {
+            drop(FILE_LINK_WARNINGS.take());
+            log::set_max_level(self.previous_level);
+        }
+    }
+
+    struct FileLinkTestLogger;
+
+    impl log::Log for FileLinkTestLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::max_level()
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            let captured = FILE_LINK_WARNINGS.with_borrow_mut(|warnings| {
+                if record.level() == log::Level::Warn
+                    && let Some(warnings) = warnings
+                {
+                    warnings.push(record.args().to_string());
+                    true
+                } else {
+                    false
+                }
+            });
+            if !captured {
+                eprintln!("{} {}: {}", record.level(), record.target(), record.args());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+}
+
+const FAST_MODE_WARNING_NAMESPACE: &str = "fast-mode-warning-dismissed";
+
+fn fast_mode_warning_id(
+    provider_id: &LanguageModelProviderId,
+    model_id: &LanguageModelId,
+) -> String {
+    format!("{}:{}", provider_id.0, model_id.0)
+}
+
+fn fast_mode_warning_dismissed(
+    provider_id: &LanguageModelProviderId,
+    model_id: &LanguageModelId,
+    cx: &App,
+) -> bool {
+    KeyValueStore::global(cx)
+        .scoped(FAST_MODE_WARNING_NAMESPACE)
+        .read(&fast_mode_warning_id(provider_id, model_id))
+        .log_err()
+        .flatten()
+        .is_some()
+}
+
+fn set_fast_mode_warning_dismissed(
+    provider_id: &LanguageModelProviderId,
+    model_id: &LanguageModelId,
+    cx: &mut App,
+) {
+    let key = fast_mode_warning_id(provider_id, model_id);
+    let kvp = KeyValueStore::global(cx);
+    cx.background_spawn(async move {
+        kvp.scoped(FAST_MODE_WARNING_NAMESPACE)
+            .write(key, "1".to_string())
+            .await
+            .log_err();
+    })
+    .detach();
+}
+
+pub(crate) fn reset_fast_mode_warnings(cx: &mut App) {
+    let kvp = KeyValueStore::global(cx);
+    cx.background_spawn(async move {
+        kvp.scoped(FAST_MODE_WARNING_NAMESPACE)
+            .delete_all()
+            .await
+            .log_err();
+    })
+    .detach();
 }

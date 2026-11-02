@@ -1,27 +1,19 @@
-## Context
+## Summary
 
-<!-- What does this PR do, and why? How is it expected to impact users?
-     Not just what changed, but what motivated it and why this approach.
+What problem does this solve, how, and why does this change matter?
+Use "Closes #123" for each issue resolved.
+Include artifacts produced when testing: before/after screenshots, GIFs, videos, benchmarks.
 
-     Link to Linear issue (e.g., ENG-123) or GitHub issue (e.g., Closes #456)
-     if one exists — helps with traceability. -->
+## Testing
 
-## How to Review
+Manually test your changes; report results, mention platforms if relevant.
+How can reviewers test this easily? Include setup and steps.
 
-<!-- Help reviewers focus their attention:
-     - For small PRs: note what to focus on (e.g., "error handling in foo.rs")
-     - For large PRs (>400 LOC): provide a guided tour — numbered list of
-       files/commits to read in order. (The `large-pr` label is applied automatically.)
-     - See the review process guidelines for comment conventions -->
+## Self-review
 
-## Self-Review Checklist
-
-<!-- Check before requesting review: -->
-- [ ] I've reviewed my own diff for quality, security, and reliability
-- [ ] Unsafe blocks (if any) have justifying comments
-- [ ] The content is consistent with the [UI/UX checklist](https://github.com/zed-industries/zed/blob/main/CONTRIBUTING.md#uiux-checklist)
-- [ ] Tests cover the new/changed behavior
-- [ ] Performance impact has been considered and is acceptable
+- [ ] I've reviewed my diff for quality, security, reliability, and performance.
+- [ ] UI changes follow the [checklist](https://zed.dev/docs/development/ui-checklist).
+- [ ] Tests cover the new or changed behavior.
 
 Release Notes:
 

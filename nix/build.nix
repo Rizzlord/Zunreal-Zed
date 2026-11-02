@@ -38,6 +38,9 @@
   libxfixes,
   libxkbcommon,
   libxrandr,
+  lld,
+  libx11,
+  libxcb,
   nodejs_22,
   openssl,
   perl,
@@ -76,7 +79,12 @@ let
     in
     builtins.elem firstComp topLevelIncludes;
 
+  corgiPatches = builtins.path {
+    path = ../tooling/corgi/patches;
+    name = "corgi-patches";
+  };
   craneLib = crane.overrideToolchain rustToolchain;
+  gpu-lib = if withGLES then libglvnd else vulkan-loader;
   commonArgs =
     let
       zedCargoLock = builtins.fromTOML (builtins.readFile ../crates/zed/Cargo.toml);
@@ -109,6 +117,10 @@ let
           new: old: rec {
             version = "0.8.2";
 
+            # nixpkgs' newer cargo-about enables a CLI feature absent in 0.8.2.
+            cargoBuildFeatures = [ ];
+            cargoCheckFeatures = [ ];
+
             src = fetchFromGitHub {
               owner = "EmbarkStudios";
               repo = "cargo-about";
@@ -134,6 +146,8 @@ let
       ]
       ++ lib.optionals stdenv'.hostPlatform.isLinux [ makeWrapper ]
       ++ lib.optionals stdenv'.hostPlatform.isDarwin [
+        # Provides `ld64.lld` for clang's `-fuse-ld=lld`.
+        lld
         (cargo-bundle.overrideAttrs (
           new: old: {
             version = "0.6.1-zed";
@@ -178,10 +192,10 @@ let
         libva
         libxkbcommon
         wayland
+        gpu-lib
         libglvnd
-        vulkan-loader
-        xorg.libX11
-        xorg.libxcb
+        libx11
+        libxcb
         libdrm
         libgbm
         libva
@@ -225,7 +239,14 @@ let
         ZED_UPDATE_EXPLANATION = "Zed has been installed using Nix. Auto-updates have thus been disabled.";
         RELEASE_VERSION = version;
         ZED_COMMIT_SHA = lib.optionalString (commitSha != null) "${commitSha}";
-        LK_CUSTOM_WEBRTC = pkgs.callPackage ./livekit-libwebrtc/package.nix { };
+        LK_CUSTOM_WEBRTC = pkgs.livekit-libwebrtc.overrideAttrs (
+          old:
+          lib.optionalAttrs stdenv'.hostPlatform.isLinux {
+            # Wayland capture dlopens EGL/GL, so fixup would otherwise remove their search path.
+            NIX_LDFLAGS = (old.NIX_LDFLAGS or "") + " -rpath ${lib.makeLibraryPath [ libglvnd ]}";
+            dontPatchELF = true;
+          }
+        );
         PROTOC = "${protobuf}/bin/protoc";
 
         CARGO_PROFILE = profile;
@@ -236,17 +257,21 @@ let
         # about them that's special is that they're manually dlopened at runtime
         NIX_LDFLAGS = lib.optionalString stdenv'.hostPlatform.isLinux "-rpath ${
           lib.makeLibraryPath [
-            libglvnd
-            vulkan-loader
+            gpu-lib
             wayland
             libva
           ]
         }";
 
         NIX_OUTPATH_USED_AS_RANDOM_SEED = "norebuilds";
+      }
+      // lib.optionalAttrs stdenv'.hostPlatform.isDarwin {
+        # Link with lld on Darwin. nixpkgs' classic open-source ld64 fails to insert
+        # ARM64 branch thunks for this binary, producing `b(l) ARM64 branch out of range`.
+        NIX_CFLAGS_LINK = "-fuse-ld=lld";
       };
 
-      # prevent nix from removing the "unused" wayland rpaths
+      # prevent nix from removing the "unused" wayland/gpu-lib rpaths
       dontPatchELF = stdenv'.hostPlatform.isLinux;
 
       # TODO: try craneLib.cargoNextest separate output
@@ -295,11 +320,32 @@ let
             drv;
       };
     };
-  cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+  cargoArtifacts = craneLib.buildDepsOnly (
+    builtins.removeAttrs commonArgs [ "src" ]
+    // {
+      dummySrc = craneLib.mkDummySrc {
+        inherit (commonArgs) src cargoLock;
+        # `scratch` is a local dependency of `cxx-build`, so its API is needed
+        # while Crane builds third-party dependencies.
+        extraDummyScript = ''
+          rm -rf $out/tooling/corgi/patches
+          mkdir -p $out/tooling/corgi
+          cp --recursive ${corgiPatches} $out/tooling/corgi/patches
+        '';
+      };
+    }
+  );
 in
 craneLib.buildPackage (
   lib.recursiveUpdate commonArgs {
     inherit cargoArtifacts;
+
+    # Expose the crane builder and shared arguments so other derivations (e.g.
+    # the docs preprocessor in the devshell) can build sibling workspace crates
+    # without duplicating all of the build inputs and environment setup.
+    passthru = {
+      inherit craneLib commonArgs cargoArtifacts;
+    };
 
     dontUseCmakeConfigure = true;
 
